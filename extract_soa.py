@@ -56,15 +56,31 @@ def grab(text, label, stop=r"\n"):
     return m.group(1).strip() if m else None
 
 
+# The SOA header is a 2/3-column layout, so a single physical line often carries
+# more than one label. Free-text values must stop before the next known label
+# (or end-of-line / underscore filler), otherwise they bleed into the next column.
+_STOP_LABELS = (
+    "Disbursement Date", "Loan Amount", "Annualised", "Interest Rate Type",
+    "Interest Paid", "Loan Tenure", "Balance Tenure", "Loan Status",
+    "Available Limit", "Moratorium", "First Instalment", "Instalment start",
+    "Instalment End", "Frequency", "EMI Due Date", "Repayment Mode",
+    "Principal Paid", "Instalment overdue", "Late Payment", "Excess amount",
+    "Amount Under", "HSN Code", "Bank Account", "Bank Name", "Mandate Status",
+    "Place of Supply", "State Code", "Customer GSTIN", "Customer ID",
+    "Central KYC", "Email", "Mobile No", "Agreement No", "Currency",
+)
+STOP = r"(?=\s+(?:" + "|".join(_STOP_LABELS) + r")\b|\s*\n|\s*_|\s*$)"
+
+
 def extract_master(text):
     """Pull the labelled key/value fields from the header block."""
     fields = {
-        "Applicant name": r"Applicant name:\s*([^\n]+)",
-        "Agreement No": r"Agreement No:\s*([^\n]+)",
-        "Customer ID": r"Customer ID:\s*([^\n]+)",
-        "Product": r"Product:\s*([^\n]+)",
-        "LTF GSTIN ID": r"LTF GSTIN ID:\s*([^\n]+)",
-        "Branch": r"Branch:\s*([^\n]+)",
+        "Applicant name": r"Applicant name:\s*(.+?)" + STOP,
+        "Agreement No": r"Agreement No:\s*(.+?)" + STOP,
+        "Customer ID": r"Customer ID:\s*(.+?)" + STOP,
+        "Product": r"Product:\s*(.+?)" + STOP,
+        "LTF GSTIN ID": r"LTF GSTIN ID:\s*(.+?)" + STOP,
+        "Branch": r"Branch:\s*(.+?)" + STOP,
         "Disbursement Date": r"Disbursement Date:\s*([0-9A-Za-z\-]+)",
         "Loan Amount (Rs)": r"Loan Amount \(Rs\):\s*([\d,]+\.\d{2})",
         "Annualised Interest Rate %": r"Annualised Interest Rate %:\s*([\d.]+)",
@@ -77,19 +93,47 @@ def extract_master(text):
         "Instalment start date": r"Instalment start date:\s*([0-9A-Za-z\-]+)",
         "Instalment End date": r"Instalment End date\s*:\s*([0-9A-Za-z\-]+)",
         "Frequency": r"Frequency:\s*([A-Za-z]+)",
-        "EMI Due Date": r"EMI Due Date:\s*([^\n]+)",
+        "EMI Due Date": r"EMI Due Date:\s*(.+?)" + STOP,
         "Repayment Mode": r"Repayment Mode:\s*([A-Za-z]+)",
-        "Bank Name": r"Bank Name:\s*([^\n]+)",
+        "Bank Name": r"Bank Name:\s*(.+?)" + STOP,
+        "Bank Account": r"Bank Account:\s*(.+?)" + STOP,
         "Mandate Status": r"Mandate Status:\s*([A-Za-z]+)",
         "Principal Paid (Rs)": r"Principal Paid \(Rs\):\s*([\d,]+\.\d{2})",
         "Interest Paid (Rs)": r"Interest Paid \(Rs\):\s*([\d,]+\.\d{2})",
         "Instalment overdue (Rs)": r"Instalment overdue \(Rs\):\s*([\d,]+\.\d{2})",
         "Late Payment Charges (Rs)": r"Late Payment Charges \(Rs\):\s*([\d,]+\.\d{2})",
+        "Excess amount": r"Excess amount:\s*([\d,]+\.\d{2})",
+        "Amount Under Clearance": r"Amount Under Clearance:\s*([\d,]+\.\d{2})",
+        # contact / KYC / GST
+        "Mobile No.": r"Mobile No\.?:\s*(.+?)" + STOP,
+        "Email": r"Email:\s*(\S+)",
+        "State Code": r"State Code:\s*(\d+)",
+        "Place of Supply": r"Place of Supply\s+(.+?)" + STOP,
+        "Customer GSTIN ID": r"Customer GSTIN ID:\s*(\S+)",
+        "HSN Code": r"HSN Code:\s*(\d+)",
+        "Central KYC (CKYC) Id": r"Central KYC:\s*(\S+)",
+        "Available Limit": r"Available Limit:\s*([\d,]*\.\d{2})",
+        "Currency": r"Currency\s*:\s*([A-Z]+)",
     }
     out = {}
     for k, pat in fields.items():
         m = re.search(pat, text)
-        out[k] = m.group(1).strip() if m else None
+        if m:
+            # some patterns have alternation groups; take first non-empty
+            val = next((g for g in m.groups() if g), m.group(0))
+            out[k] = val.strip()
+        else:
+            out[k] = None
+
+    # Customer name (first line of the customer block) + best-effort address
+    out["Customer Name"] = out.get("Applicant name")
+    am = re.search(r"Customer Name & Contact Details Product Details\s*\n([^\n]+)", text)
+    if am:
+        out["Customer Name"] = am.group(1).strip()
+    # Address: lines after customer name up to the Phone/HSN noise line
+    addr = re.findall(r"\n((?:\d+,\s*[^\n]+|[A-Z][A-Z ,]+ESTATE[^\n]*|NEAR[^\n]*))", text)
+    if addr:
+        out["Address / Contact Details"] = " ".join(a.strip() for a in addr[:4])
 
     # Statement period & date (top line)
     m = re.search(r"for the period\s+([0-9A-Za-z\-]+)\s+to\s+([0-9A-Za-z\-]+)\s+Dated\s+([0-9A-Za-z\-]+)", text)
@@ -131,6 +175,40 @@ def extract_disbursements(text):
         dm = re.match(r"\s*(\d+)\s+(\d{2}-[A-Z]{3}-\d{4})\s+([\d,]+\.\d{2})\s+(.*)", line)
         if dm:
             rows.append([int(dm.group(1)), dm.group(2), to_num(dm.group(3)), dm.group(4).strip()])
+    return rows
+
+
+def extract_bounce_summary(text):
+    """Parse the BOUNCE SUMMARY table. Returns [] when the SOA shows 'NA'."""
+    rows = []
+    m = re.search(r"BOUNCE SUMMARY\s*\n.*?REASON\s*\n(.*?)(?:\n\s*The Company|BOUNCE CHARGES|=====|$)",
+                  text, re.S)
+    if not m:
+        return rows
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if not line or line.upper().startswith("NA NA"):
+            continue
+        dm = re.match(r"(\d{2}-[A-Z]{3}-\d{4})\s+(.*?)\s+([\d,]+\.\d{2})\s+(.*)$", line)
+        if dm:
+            rows.append([dm.group(1), dm.group(2).strip(), to_num(dm.group(3)), dm.group(4).strip()])
+    return rows
+
+
+def extract_part_payment(text):
+    """Parse the PART PAYMENT SUMMARY table. Returns [] when the SOA shows 'NA'."""
+    rows = []
+    m = re.search(r"PART PAYMENT SUMMARY\s*\n[^\n]*Impact\s*\n(.*?)(?:\n\s*The amounts|BOUNCE SUMMARY|=====|$)",
+                  text, re.S)
+    if not m:
+        return rows
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if not line or line.upper().startswith("NA"):
+            continue
+        dm = re.match(r"(\d{2}-[A-Z]{3}-\d{4})\s+([\d,]+\.\d{2})\s+(.*)$", line)
+        if dm:
+            rows.append([dm.group(1), to_num(dm.group(2)), dm.group(3).strip()])
     return rows
 
 
@@ -310,7 +388,8 @@ def autosize(ws, max_w=60):
         ws.column_dimensions[letter].width = min(width + 3, max_w)
 
 
-def write_workbook(path, master, fin_rows, recv, disb, txns, checks, dpd_rows):
+def write_workbook(path, master, fin_rows, recv, disb, txns, checks, dpd_rows,
+                   part_pay=None, bounce=None):
     wb = Workbook()
 
     # --- Loan_Master ---
@@ -352,6 +431,28 @@ def write_workbook(path, master, fin_rows, recv, disb, txns, checks, dpd_rows):
         ws.append([t["Date"], t["Value Date"], t["Particulars"], t["DR"], t["CR"], t["Balance"]])
     ws.freeze_panes = "A2"; autosize(ws)
 
+    # --- Part_Payment ---
+    ws = wb.create_sheet("Part_Payment")
+    ws.append(["Repayment Effective Date", "Part payment amount", "Impact"])
+    style_header(ws, 1, 3)
+    if part_pay:
+        for p in part_pay:
+            ws.append(p)
+    else:
+        ws.append(["NA", "NA", "NA"])
+    autosize(ws)
+
+    # --- Bounce_Summary ---
+    ws = wb.create_sheet("Bounce_Summary")
+    ws.append(["Date of Bounce", "Narration", "Amount", "Reason"])
+    style_header(ws, 1, 4)
+    if bounce:
+        for b in bounce:
+            ws.append(b)
+    else:
+        ws.append(["NA", "NA", "NA", "NA"])
+    autosize(ws)
+
     # --- DPD_Analysis ---
     ws = wb.create_sheet("DPD_Analysis")
     ws.append(["Instalment", "Due Date", "Amount", "Paid Date", "DPD (days)"])
@@ -386,8 +487,11 @@ def process(pdf_path, out_path):
     fin_rows, recv = extract_finance_summary(full)
     disb = extract_disbursements(full)
     txns = extract_transactions(pages)
+    part_pay = extract_part_payment(full)
+    bounce = extract_bounce_summary(full)
     checks, dpd_rows = build_checks(master, fin_rows, recv, disb, txns)
-    write_workbook(out_path, master, fin_rows, recv, disb, txns, checks, dpd_rows)
+    write_workbook(out_path, master, fin_rows, recv, disb, txns, checks, dpd_rows,
+                   part_pay=part_pay, bounce=bounce)
     print(f"[OK] {os.path.basename(pdf_path)} -> {out_path}  "
           f"({len(txns)} txns, {len(checks)} checks, {len(dpd_rows)} instalments)")
 
