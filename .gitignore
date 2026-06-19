@@ -2,3 +2,6 @@
 loan_details/
 __pycache__/
 *.pyc
+# local test data & demo artifacts (may contain customer PII)
+test_run/
+*.pdf
