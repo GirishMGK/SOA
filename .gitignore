@@ -1,0 +1,4 @@
+*.xlsx
+loan_details/
+__pycache__/
+*.pyc

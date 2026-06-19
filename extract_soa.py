@@ -6,11 +6,21 @@ Parses the PDF SOA into a structured workbook with:
   - Finance_Summary  : "Loan Finance Summary" + receivable block
   - Disbursements    : disbursement summary table
   - Transactions     : full ledger (Date / Value Date / Particulars / DR / CR / Balance)
+  - Charges          : discrete fee line-items (PF / BPI / insurance / TDS)
+  - Bounce_Charge_Grid : the EMI-bounce charge slab table
+  - Amortization     : reducing-balance schedule (recomputed)
   - TOC_TOD          : auto-computed audit validation checks
 
+It also batches a folder of SOAs into a single PORTFOLIO EXCEPTION REPORT
+(Portfolio_Summary / Exceptions / DPD_NPA / Charges) covering four check
+families: EMI & amortization recompute, DPD/NPA staging, charges validation,
+and ledger/balance reconciliation.
+
 Usage:
-    python extract_soa.py <input.pdf> [output.xlsx]
-    python extract_soa.py --dir <folder_of_pdfs> <output_folder>
+    python extract_soa.py <input.pdf> [output.xlsx]          # single loan workbook
+    python extract_soa.py --dir <folder> <output_folder>     # per-loan workbooks
+    python extract_soa.py --portfolio <folder> [report.xlsx] # portfolio exception report
+                                                             #   (+ per-loan books in ./loan_details)
 """
 import re
 import sys
@@ -247,8 +257,12 @@ def emi_calc(principal, annual_rate, n):
     return principal * r * (1 + r) ** n / ((1 + r) ** n - 1)
 
 
-def build_checks(master, fin_rows, recv, disb, txns):
+def build_checks(master, fin_rows, recv, disb, txns, charges=None,
+                 bounce_grid=None, bounce_rows=None):
     checks = []
+    charges = charges or []
+    bounce_grid = bounce_grid or []
+    bounce_rows = bounce_rows or []
 
     def add(cid, area, desc, expected, actual, status, remark=""):
         checks.append([cid, area, desc, expected, actual, status, remark])
@@ -259,6 +273,9 @@ def build_checks(master, fin_rows, recv, disb, txns):
     emi_actual = to_num(master.get("First Instalment Amount (Rs)"))
     prin_paid = to_num(master.get("Principal Paid (Rs)"))
     int_paid = to_num(master.get("Interest Paid (Rs)"))
+    stmt_date = to_date(master.get("Statement Date") or "")
+    disb_date = to_date(master.get("Disbursement Date") or "")
+    inst_start = to_date(master.get("Instalment start date") or "")
 
     # 1. EMI re-computation
     if loan_amt and rate and tenure and emi_actual:
@@ -311,25 +328,88 @@ def build_checks(master, fin_rows, recv, disb, txns):
     # 6. DPD / overdue analysis from ledger (due vs payment dates)
     dpd_rows = analyse_dpd(txns)
     max_dpd = max((d["DPD"] for d in dpd_rows), default=0)
-    st = "PASS" if max_dpd <= 0 else ("REVIEW" if max_dpd <= 30 else "FAIL")
-    add("TOC-02", "DPD/NPA", "Max days-past-due across instalments",
-        "0 days", f"{max_dpd} days", st,
-        "DPD>90 indicates NPA per RBI IRACP norms")
+    # minor cured delays (<=30d) are informational; 31-90 review; >90 a past NPA event
+    st = ("PASS" if max_dpd <= 0 else "INFO" if max_dpd <= 30
+          else "REVIEW" if max_dpd <= 90 else "FAIL")
+    add("TOC-02", "DPD/NPA", "Max historical days-past-due across instalments",
+        "0 days", f"{max_dpd} days ({npa_stage(max_dpd)})", st,
+        "DPD>90 would have triggered NPA per RBI IRACP norms")
+
+    # 6b. Current asset classification (unpaid dues as on statement date)
+    cur_dpd = 0
+    if stmt_date:
+        unpaid = [d for d in dpd_rows if d["Paid Date"] is None
+                  and d["Due Date"] and d["Due Date"] <= stmt_date]
+        if unpaid:
+            earliest = min(d["Due Date"] for d in unpaid)
+            cur_dpd = (stmt_date - earliest).days
+    stage = npa_stage(cur_dpd)
+    st = "PASS" if cur_dpd <= 0 else ("REVIEW" if cur_dpd <= 90 else "FAIL")
+    add("TOC-03", "DPD/NPA", "Current asset classification as on statement date",
+        "Standard (0 DPD)", f"{cur_dpd} days -> {stage}", st)
 
     # 7. Interest income recognition (Interest Paid present & positive)
     if int_paid is not None:
         st = "PASS" if int_paid >= 0 else "FAIL"
-        add("TOC-03", "Income", "Interest Paid recorded (income recognition)",
+        add("TOC-04", "Income", "Interest Paid recorded (income recognition)",
             ">=0", f"{int_paid:,.2f}", st)
 
-    # 8. Closing balance of ledger should be 0 for fully serviced active loan
+    # 8. Processing fee % of sanction (charge reasonableness)
+    pf = next((c for c in charges if c["Category"] == "Processing Fee" and c["DR"]), None)
+    if pf and loan_amt:
+        incl = pf["DR"]
+        base = round(incl / (1 + GST_RATE), 2)
+        pct = base / loan_amt * 100
+        st = "PASS" if pct <= PF_PCT_THRESHOLD else "REVIEW"
+        add("TOC-05", "Charges", "Processing fee % of sanctioned amount",
+            f"<= {PF_PCT_THRESHOLD:.1f}%", f"{pct:.2f}% (base {base:,.2f} excl GST)", st,
+            f"PF incl. tax {incl:,.2f}; assumed GST {GST_RATE*100:.0f}%")
+
+    # 9. Broken-period interest reasonableness.
+    # BPI accrues from disbursal to the start of the first billing cycle, i.e. one
+    # instalment period before the first EMI date - not all the way to the 1st EMI.
+    bpi = next((c for c in charges if c["Category"] == "Broken Period Interest" and c["DR"]), None)
+    if bpi and loan_amt and rate and disb_date and inst_start:
+        months = FREQ_MONTHS.get((master.get("Frequency") or "MONTHLY").upper(), 1)
+        cycle_start = _minus_months(inst_start, months)
+        days = max((cycle_start - disb_date).days, 0)
+        exp = round(loan_amt * rate / 100 * days / 365.0, 2)
+        actual = bpi["DR"]
+        rel = abs(actual - exp) / exp if exp else 0
+        st = "PASS" if rel <= BPI_TOLERANCE else "REVIEW"
+        add("TOD-06", "Charges", "Broken-period interest recompute (disbursal -> 1st billing cycle)",
+            f"{exp:,.2f}", f"{actual:,.2f}", st,
+            f"{days} days @ {rate:.2f}%; rel.diff {rel*100:.1f}%")
+
+    # 10. Bounce charge vs grid (only when bounces occurred)
+    exp_bounce = expected_bounce_charge(bounce_grid, loan_amt)
+    if bounce_rows:
+        for b in bounce_rows:
+            actual = b[2]
+            st = "PASS" if exp_bounce and abs((actual or 0) - exp_bounce) <= 1 else "REVIEW"
+            add("TOC-06", "Charges", f"Bounce charge on {b[0]} vs grid",
+                f"{exp_bounce:,.2f}" if exp_bounce else "per grid",
+                f"{actual:,.2f}" if actual else "NA", st, b[1])
+    elif exp_bounce is not None:
+        add("TOC-06", "Charges", "Applicable bounce charge per grid (no bounces in period)",
+            f"{exp_bounce:,.2f}", "No bounce", "INFO",
+            "Grid rate for this sanction slab")
+
+    # 11. Closing balance of ledger
     if txns:
         last_bal = txns[-1]["Balance"]
         add("TOD-05", "Ledger", "Final running balance in transaction ledger",
             "informational", f"{last_bal:,.2f}", "INFO",
             "Should equal current overdue position")
 
-    return checks, dpd_rows
+    summary = {
+        "Max DPD": max_dpd,
+        "Current DPD": cur_dpd,
+        "Current Stage": stage,
+        "Exceptions": sum(1 for c in checks if c[5] in ("FAIL", "REVIEW")),
+        "Fails": sum(1 for c in checks if c[5] == "FAIL"),
+    }
+    return checks, dpd_rows, summary
 
 
 def analyse_dpd(txns):
@@ -363,6 +443,135 @@ def analyse_dpd(txns):
 
 
 # --------------------------------------------------------------------------- #
+# Charges, bounce grid, amortization, NPA staging
+# --------------------------------------------------------------------------- #
+GST_RATE = 0.18           # GST grossed into "Incl. Tax" charge lines
+PF_PCT_THRESHOLD = 3.0    # processing-fee % of sanction above which we flag REVIEW
+BPI_TOLERANCE = 0.15      # acceptable relative deviation on broken-period interest
+
+# keyword -> normalised charge category
+CHARGE_MAP = [
+    ("PROCESSING FEE", "Processing Fee"),
+    ("BROKEN PERIOD INTEREST", "Broken Period Interest"),
+    ("INSURANCE PREMIUM", "Insurance Premium"),
+    ("TDS", "TDS"),
+    ("BOUNCE", "Bounce / Penal Charge"),
+    ("PENAL", "Bounce / Penal Charge"),
+    ("LATE PAYMENT", "Late Payment Charge"),
+    ("FORECLOSURE", "Foreclosure Charge"),
+    ("PREPAYMENT", "Prepayment Charge"),
+]
+
+
+def extract_charges(txns):
+    """Pull discrete charge/fee line-items out of the ledger."""
+    rows = []
+    for t in txns:
+        p = t["Particulars"].upper()
+        # only genuine charge debits (or TDS credits), not instalment/payment lines
+        if "DUE FOR INSTALMENT" in p or "AMT FINANCED" in p or "PMNT RCVD" in p:
+            continue
+        for kw, cat in CHARGE_MAP:
+            if kw in p:
+                rows.append({"Category": cat, "Date": t["Date"],
+                             "Particulars": t["Particulars"],
+                             "DR": t["DR"], "CR": t["CR"]})
+                break
+    return rows
+
+
+def extract_bounce_grid(text):
+    """Parse the 'A. Repayment/EMI Bounce Charges' slab table on the charges page."""
+    grid = []
+    m = re.search(r"Charges in Rs Loan sanction amount in Rs\.\s*\n(.*?)(?:\n\s*[B-Z]\.|=====|$)",
+                  text, re.S)
+    if not m:
+        return grid
+    for line in m.group(1).splitlines():
+        dm = re.match(r"\s*(\d+)\s+(.*)$", line.strip())
+        if dm:
+            grid.append({"charge": float(dm.group(1)), "slab": dm.group(2).strip()})
+    return grid
+
+
+def _lacs(text_amt):
+    """Convert slab tokens like '5 Lacs', '2 Cr.' to rupees."""
+    n = float(re.search(r"[\d.]+", text_amt).group())
+    if "CR" in text_amt.upper():
+        return n * 1e7
+    if "LAC" in text_amt.upper():
+        return n * 1e5
+    return n
+
+
+def expected_bounce_charge(grid, sanctioned):
+    """Return the grid bounce charge applicable to the sanctioned amount."""
+    if not sanctioned:
+        return None
+    for g in grid:
+        slab = g["slab"].upper()
+        nums = re.findall(r"[\d.]+\s*(?:LACS?|CR\.?)", slab)
+        lo, hi = 0, float("inf")
+        if slab.startswith("<"):
+            hi = _lacs(nums[0])
+        elif slab.startswith(">") and len(nums) == 1:
+            lo = _lacs(nums[0])
+        elif len(nums) >= 2:
+            lo, hi = _lacs(nums[0]), _lacs(nums[1])
+        elif len(nums) == 1:
+            hi = _lacs(nums[0])
+        if lo <= sanctioned <= hi or (hi == float("inf") and sanctioned >= lo):
+            return g["charge"]
+    return None
+
+
+def build_amortization(principal, annual_rate, n, emi):
+    """Reducing-balance amortization schedule -> list of period dicts."""
+    sched = []
+    r = annual_rate / 12.0 / 100.0
+    bal = principal
+    for i in range(1, int(n) + 1):
+        interest = round(bal * r, 2)
+        prin = round(emi - interest, 2)
+        if i == int(n):                       # true-up final instalment
+            prin = round(bal, 2)
+            emi_i = round(prin + interest, 2)
+        else:
+            emi_i = emi
+        bal = round(bal - prin, 2)
+        sched.append({"No": i, "EMI": emi_i, "Interest": interest,
+                      "Principal": prin, "Balance": max(bal, 0.0)})
+    return sched
+
+
+FREQ_MONTHS = {"MONTHLY": 1, "QUARTERLY": 3, "HALF": 6, "SEMI": 6,
+               "ANNUAL": 12, "YEARLY": 12}
+
+
+def _minus_months(d, months):
+    """Subtract whole months from a date (clamped day-of-month)."""
+    m = d.month - 1 - months
+    y = d.year + m // 12
+    m = m % 12 + 1
+    import calendar
+    day = min(d.day, calendar.monthrange(y, m)[1])
+    return dt.date(y, m, day)
+
+
+def npa_stage(dpd):
+    """RBI IRACP / SMA staging from days-past-due."""
+    if dpd <= 0:
+        return "Standard"
+    if dpd <= 30:
+        return "SMA-0"
+    if dpd <= 60:
+        return "SMA-1"
+    if dpd <= 90:
+        return "SMA-2"
+    return "NPA (Sub-standard)"
+
+
+# --------------------------------------------------------------------------- #
 # Excel writer
 # --------------------------------------------------------------------------- #
 HDR_FILL = PatternFill("solid", fgColor="1F4E78")
@@ -389,7 +598,7 @@ def autosize(ws, max_w=60):
 
 
 def write_workbook(path, master, fin_rows, recv, disb, txns, checks, dpd_rows,
-                   part_pay=None, bounce=None):
+                   part_pay=None, bounce=None, charges=None, amort=None, bounce_grid=None):
     wb = Workbook()
 
     # --- Loan_Master ---
@@ -453,12 +662,37 @@ def write_workbook(path, master, fin_rows, recv, disb, txns, checks, dpd_rows,
         ws.append(["NA", "NA", "NA", "NA"])
     autosize(ws)
 
+    # --- Charges ---
+    ws = wb.create_sheet("Charges")
+    ws.append(["Category", "Date", "Particulars", "DR (Rs)", "CR (Rs)"])
+    style_header(ws, 1, 5)
+    for c in (charges or []):
+        ws.append([c["Category"], c["Date"], c["Particulars"], c["DR"], c["CR"]])
+    autosize(ws)
+
+    # --- Bounce_Charge_Grid ---
+    ws = wb.create_sheet("Bounce_Charge_Grid")
+    ws.append(["Charge (Rs)", "Loan sanction amount slab"])
+    style_header(ws, 1, 2)
+    for g in (bounce_grid or []):
+        ws.append([g["charge"], g["slab"]])
+    autosize(ws)
+
+    # --- Amortization ---
+    ws = wb.create_sheet("Amortization")
+    ws.append(["Instalment No", "EMI", "Interest", "Principal", "Closing Balance"])
+    style_header(ws, 1, 5)
+    for a in (amort or []):
+        ws.append([a["No"], a["EMI"], a["Interest"], a["Principal"], a["Balance"]])
+    ws.freeze_panes = "A2"; autosize(ws)
+
     # --- DPD_Analysis ---
     ws = wb.create_sheet("DPD_Analysis")
-    ws.append(["Instalment", "Due Date", "Amount", "Paid Date", "DPD (days)"])
-    style_header(ws, 1, 5)
+    ws.append(["Instalment", "Due Date", "Amount", "Paid Date", "DPD (days)", "Stage"])
+    style_header(ws, 1, 6)
     for d in dpd_rows:
-        ws.append([d["Instalment"], str(d["Due Date"]), d["Amount"], str(d["Paid Date"]), d["DPD"]])
+        ws.append([d["Instalment"], str(d["Due Date"]), d["Amount"],
+                   str(d["Paid Date"]), d["DPD"], npa_stage(d["DPD"])])
         if d["DPD"] > 0:
             ws.cell(ws.max_row, 5).fill = PatternFill("solid", fgColor="FFEB9C")
     autosize(ws)
@@ -479,7 +713,8 @@ def write_workbook(path, master, fin_rows, recv, disb, txns, checks, dpd_rows,
     wb.save(path)
 
 
-def process(pdf_path, out_path):
+def extract_loan(pdf_path):
+    """Parse one SOA PDF and return a dict of all extracted data + checks."""
     with pdfplumber.open(pdf_path) as pdf:
         pages = [p.extract_text() or "" for p in pdf.pages]
     full = "\n".join(pages)
@@ -489,18 +724,140 @@ def process(pdf_path, out_path):
     txns = extract_transactions(pages)
     part_pay = extract_part_payment(full)
     bounce = extract_bounce_summary(full)
-    checks, dpd_rows = build_checks(master, fin_rows, recv, disb, txns)
-    write_workbook(out_path, master, fin_rows, recv, disb, txns, checks, dpd_rows,
-                   part_pay=part_pay, bounce=bounce)
-    print(f"[OK] {os.path.basename(pdf_path)} -> {out_path}  "
-          f"({len(txns)} txns, {len(checks)} checks, {len(dpd_rows)} instalments)")
+    charges = extract_charges(txns)
+    bounce_grid = extract_bounce_grid(full)
+
+    loan_amt = to_num(master.get("Loan Amount (Rs)"))
+    rate = to_num(master.get("Annualised Interest Rate %"))
+    tenure = to_num(master.get("Loan Tenure (Months)"))
+    emi = to_num(master.get("First Instalment Amount (Rs)"))
+    amort = (build_amortization(loan_amt, rate, tenure, emi)
+             if all((loan_amt, rate, tenure, emi)) else [])
+
+    checks, dpd_rows, summary = build_checks(
+        master, fin_rows, recv, disb, txns, charges, bounce_grid, bounce)
+
+    return {
+        "file": os.path.basename(pdf_path), "master": master, "fin_rows": fin_rows,
+        "recv": recv, "disb": disb, "txns": txns, "part_pay": part_pay, "bounce": bounce,
+        "charges": charges, "bounce_grid": bounce_grid, "amort": amort,
+        "checks": checks, "dpd_rows": dpd_rows, "summary": summary,
+    }
+
+
+def process(pdf_path, out_path):
+    """Extract one SOA and write a full per-loan working-paper workbook."""
+    d = extract_loan(pdf_path)
+    write_workbook(out_path, d["master"], d["fin_rows"], d["recv"], d["disb"], d["txns"],
+                   d["checks"], d["dpd_rows"], part_pay=d["part_pay"], bounce=d["bounce"],
+                   charges=d["charges"], amort=d["amort"], bounce_grid=d["bounce_grid"])
+    print(f"[OK] {d['file']} -> {out_path}  ({len(d['txns'])} txns, "
+          f"{len(d['checks'])} checks, {d['summary']['Exceptions']} exceptions)")
+    return d
+
+
+# --------------------------------------------------------------------------- #
+# Portfolio exception report (batch)
+# --------------------------------------------------------------------------- #
+def write_portfolio(out_path, results, detail_dir=None):
+    """Aggregate many loans into one exception-focused workbook."""
+    wb = Workbook()
+
+    # --- Portfolio_Summary ---
+    ws = wb.active; ws.title = "Portfolio_Summary"
+    cols = ["File", "Agreement No", "Customer", "Product", "Sanctioned (Rs)", "Rate %",
+            "Tenure", "Bal Tenure", "EMI (Rs)", "Disb Date", "Loan Status",
+            "Principal Paid", "Interest Paid", "Overdue", "Current Stage",
+            "Max DPD", "Exceptions", "Result"]
+    ws.append(cols); style_header(ws, 1, len(cols))
+    for d in results:
+        m, s = d["master"], d["summary"]
+        result = "EXCEPTION" if s["Exceptions"] else "CLEAN"
+        ws.append([d["file"], m.get("Agreement No"), m.get("Applicant name"),
+                   m.get("Product"), to_num(m.get("Loan Amount (Rs)")),
+                   to_num(m.get("Annualised Interest Rate %")),
+                   to_num(m.get("Loan Tenure (Months)")), to_num(m.get("Balance Tenure (Months)")),
+                   to_num(m.get("First Instalment Amount (Rs)")), m.get("Disbursement Date"),
+                   m.get("Loan Status"), to_num(m.get("Principal Paid (Rs)")),
+                   to_num(m.get("Interest Paid (Rs)")), to_num(m.get("Instalment overdue (Rs)")),
+                   s["Current Stage"], s["Max DPD"], s["Exceptions"], result])
+        fill = "FFC7CE" if s["Fails"] else ("FFEB9C" if s["Exceptions"] else "C6EFCE")
+        ws.cell(ws.max_row, len(cols)).fill = PatternFill("solid", fgColor=fill)
+    ws.freeze_panes = "A2"; autosize(ws)
+
+    # --- Exceptions (only FAIL / REVIEW across all loans) ---
+    ws = wb.create_sheet("Exceptions")
+    cols = ["File", "Agreement No", "Check ID", "Area", "Procedure / Assertion",
+            "Expected", "Actual", "Status", "Remark"]
+    ws.append(cols); style_header(ws, 1, len(cols))
+    for d in results:
+        agr = d["master"].get("Agreement No")
+        for c in d["checks"]:
+            if c[5] in ("FAIL", "REVIEW"):
+                ws.append([d["file"], agr] + c)
+                ws.cell(ws.max_row, 8).fill = PatternFill("solid", fgColor=STATUS_FILL.get(c[5]))
+    ws.freeze_panes = "A2"; autosize(ws)
+
+    # --- DPD_NPA (delayed instalments only) ---
+    ws = wb.create_sheet("DPD_NPA")
+    cols = ["File", "Agreement No", "Instalment", "Due Date", "Amount",
+            "Paid Date", "DPD (days)", "Stage"]
+    ws.append(cols); style_header(ws, 1, len(cols))
+    for d in results:
+        agr = d["master"].get("Agreement No")
+        for r in d["dpd_rows"]:
+            if r["DPD"] > 0:
+                ws.append([d["file"], agr, r["Instalment"], str(r["Due Date"]),
+                           r["Amount"], str(r["Paid Date"]), r["DPD"], npa_stage(r["DPD"])])
+    ws.freeze_panes = "A2"; autosize(ws)
+
+    # --- Charges (all charge line-items across loans) ---
+    ws = wb.create_sheet("Charges")
+    cols = ["File", "Agreement No", "Category", "Date", "Particulars", "DR (Rs)", "CR (Rs)"]
+    ws.append(cols); style_header(ws, 1, len(cols))
+    for d in results:
+        agr = d["master"].get("Agreement No")
+        for c in d["charges"]:
+            ws.append([d["file"], agr, c["Category"], c["Date"], c["Particulars"], c["DR"], c["CR"]])
+    ws.freeze_panes = "A2"; autosize(ws)
+
+    wb.save(out_path)
+    n_exc = sum(1 for d in results if d["summary"]["Exceptions"])
+    print(f"[PORTFOLIO] {len(results)} loans -> {out_path}  "
+          f"({n_exc} loan(s) with exceptions)")
+
+
+def process_portfolio(folder, out_path, write_details=True):
+    results = []
+    detail_dir = os.path.join(os.path.dirname(out_path) or ".", "loan_details")
+    if write_details:
+        os.makedirs(detail_dir, exist_ok=True)
+    for f in sorted(os.listdir(folder)):
+        if not f.lower().endswith(".pdf"):
+            continue
+        path = os.path.join(folder, f)
+        try:
+            if write_details:
+                d = process(path, os.path.join(detail_dir, os.path.splitext(f)[0] + ".xlsx"))
+            else:
+                d = extract_loan(path)
+            results.append(d)
+        except Exception as e:                       # keep batch resilient
+            print(f"[ERROR] {f}: {e}")
+    if results:
+        write_portfolio(out_path, results)
+    return results
 
 
 def main():
     args = sys.argv[1:]
     if not args:
         print(__doc__); sys.exit(1)
-    if args[0] == "--dir":
+    if args[0] == "--portfolio":
+        folder = args[1]
+        out_path = args[2] if len(args) > 2 else "Portfolio_Exception_Report.xlsx"
+        process_portfolio(folder, out_path)
+    elif args[0] == "--dir":
         folder, out_folder = args[1], args[2]
         os.makedirs(out_folder, exist_ok=True)
         for f in os.listdir(folder):
