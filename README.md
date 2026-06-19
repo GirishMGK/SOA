@@ -13,9 +13,21 @@ pip install pdfplumber openpyxl flask
 ```bash
 python app.py            # then open http://127.0.0.1:5000
 ```
-Upload one SOA PDF to download its working-paper workbook, or upload several to
-download a single Portfolio Exception Report bundled with the per-loan workbooks
-(as a zip). Set a custom port with `PORT=8080 python app.py`.
+Upload SOAs as **individual PDFs, a whole folder, or a `.zip`**. Files are
+processed one-by-one with a **live progress bar** and an on-screen results
+table showing, per loan: result (CLEAN / EXCEPTION / FAILED), current NPA
+stage, exception count, parse-quality, and sanctioned amount. Running totals
+(uploaded / clean / with-exceptions / failed) update live, and a portfolio
+health line shows NPA count and total sanctioned value.
+
+Download options after a run:
+- any single loan's workbook (per-row link),
+- the **Portfolio Exception Report**,
+- **all** loans as a zip, or **exceptions only** as a zip.
+
+A bad/corrupt file is reported as FAILED with the reason and never aborts the
+batch. Nothing is persisted beyond the running session. Custom port:
+`PORT=8080 python app.py`.
 
 ## Command line
 ```bash
