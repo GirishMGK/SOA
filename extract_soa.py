@@ -257,6 +257,62 @@ def emi_calc(principal, annual_rate, n):
     return principal * r * (1 + r) ** n / ((1 + r) ** n - 1)
 
 
+# --------------------------------------------------------------------------- #
+# Parse-quality assessment
+# --------------------------------------------------------------------------- #
+# Fields the validation checks depend on; if any is missing the loan is flagged.
+CRITICAL_FIELDS = [
+    "Agreement No", "Loan Amount (Rs)", "Annualised Interest Rate %",
+    "Loan Tenure (Months)", "First Instalment Amount (Rs)", "Disbursement Date",
+    "Instalment start date", "Statement Date", "Principal Paid (Rs)",
+    "Interest Paid (Rs)",
+]
+
+
+def assess_quality(master, fin_rows, recv, disb, txns):
+    """Score how completely the SOA parsed, so weak extractions get manual review.
+
+    Distinguishes *structural* problems (missing fields/sections -> REVIEW) from
+    *cosmetic* notes (e.g. wrapped particulars where amounts are still correct),
+    so a fully-usable extraction isn't flagged for review over presentation noise.
+    """
+    EMPTY = (None, "")
+    missing_critical = [f for f in CRITICAL_FIELDS if master.get(f) in EMPTY]
+    missing_other = [k for k, v in master.items()
+                     if v in EMPTY and k not in CRITICAL_FIELDS]
+    warnings = []   # structural -> drive REVIEW
+    notes = []      # cosmetic -> informational only
+    if len(fin_rows) < 4:
+        warnings.append("Loan Finance Summary not fully parsed")
+    if recv.get("Total Receivable") in EMPTY:
+        warnings.append("Receivable block not parsed")
+    if not disb:
+        warnings.append("No disbursement rows parsed")
+    if not txns:
+        warnings.append("No ledger transactions parsed")
+    # wrapped/mangled ledger rows: particulars that start with a numeric amount
+    mangled = sum(1 for t in txns if re.match(r"^[\d,]+\.\d", t["Particulars"] or ""))
+    if mangled:
+        notes.append(f"{mangled} ledger row(s) with wrapped particulars (amounts OK)")
+
+    captured = sum(1 for v in master.values() if v not in EMPTY)
+    total = len(master) or 1
+    status = "REVIEW" if (missing_critical or warnings) else "OK"
+    return {
+        "status": status,
+        "missing_critical": missing_critical,
+        "missing_other": missing_other,
+        "warnings": warnings,
+        "notes": notes,
+        "captured": captured,
+        "total": total,
+        "completeness": round(captured / total * 100, 1),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# TOC / TOD validation checks
+# --------------------------------------------------------------------------- #
 def build_checks(master, fin_rows, recv, disb, txns, charges=None,
                  bounce_grid=None, bounce_rows=None):
     checks = []
@@ -598,7 +654,8 @@ def autosize(ws, max_w=60):
 
 
 def write_workbook(path, master, fin_rows, recv, disb, txns, checks, dpd_rows,
-                   part_pay=None, bounce=None, charges=None, amort=None, bounce_grid=None):
+                   part_pay=None, bounce=None, charges=None, amort=None, bounce_grid=None,
+                   quality=None):
     wb = Workbook()
 
     # --- Loan_Master ---
@@ -710,6 +767,26 @@ def write_workbook(path, master, fin_rows, recv, disb, txns, checks, dpd_rows,
             ws.cell(ws.max_row, 6).fill = PatternFill("solid", fgColor=fill)
     autosize(ws)
 
+    # --- Parse_Quality ---
+    if quality:
+        ws = wb.create_sheet("Parse_Quality")
+        ws["A1"] = "EXTRACTION QUALITY / DATA-INTEGRITY LOG"; ws["A1"].font = TITLE_FONT
+        ws.append([])
+        rows = [
+            ("Parse Status", quality["status"]),
+            ("Fields captured", f"{quality['captured']} / {quality['total']} ({quality['completeness']}%)"),
+            ("Missing critical fields", ", ".join(quality["missing_critical"]) or "None"),
+            ("Missing other fields", ", ".join(quality["missing_other"]) or "None"),
+            ("Warnings (structural)", "; ".join(quality["warnings"]) or "None"),
+            ("Notes (cosmetic)", "; ".join(quality.get("notes", [])) or "None"),
+        ]
+        ws.append(["Metric", "Value"]); style_header(ws, 3, 2)
+        for k, v in rows:
+            ws.append([k, v])
+        sc = ws.cell(4, 2)  # Parse Status value cell
+        sc.fill = PatternFill("solid", fgColor=STATUS_FILL.get(quality["status"], "DDEBF7"))
+        autosize(ws)
+
     wb.save(path)
 
 
@@ -736,12 +813,13 @@ def extract_loan(pdf_path):
 
     checks, dpd_rows, summary = build_checks(
         master, fin_rows, recv, disb, txns, charges, bounce_grid, bounce)
+    quality = assess_quality(master, fin_rows, recv, disb, txns)
 
     return {
         "file": os.path.basename(pdf_path), "master": master, "fin_rows": fin_rows,
         "recv": recv, "disb": disb, "txns": txns, "part_pay": part_pay, "bounce": bounce,
         "charges": charges, "bounce_grid": bounce_grid, "amort": amort,
-        "checks": checks, "dpd_rows": dpd_rows, "summary": summary,
+        "checks": checks, "dpd_rows": dpd_rows, "summary": summary, "quality": quality,
     }
 
 
@@ -750,7 +828,8 @@ def process(pdf_path, out_path):
     d = extract_loan(pdf_path)
     write_workbook(out_path, d["master"], d["fin_rows"], d["recv"], d["disb"], d["txns"],
                    d["checks"], d["dpd_rows"], part_pay=d["part_pay"], bounce=d["bounce"],
-                   charges=d["charges"], amort=d["amort"], bounce_grid=d["bounce_grid"])
+                   charges=d["charges"], amort=d["amort"], bounce_grid=d["bounce_grid"],
+                   quality=d["quality"])
     print(f"[OK] {d['file']} -> {out_path}  ({len(d['txns'])} txns, "
           f"{len(d['checks'])} checks, {d['summary']['Exceptions']} exceptions)")
     return d
@@ -768,10 +847,10 @@ def write_portfolio(out_path, results, detail_dir=None):
     cols = ["File", "Agreement No", "Customer", "Product", "Sanctioned (Rs)", "Rate %",
             "Tenure", "Bal Tenure", "EMI (Rs)", "Disb Date", "Loan Status",
             "Principal Paid", "Interest Paid", "Overdue", "Current Stage",
-            "Max DPD", "Exceptions", "Result"]
+            "Max DPD", "Exceptions", "Parse Status", "Result"]
     ws.append(cols); style_header(ws, 1, len(cols))
     for d in results:
-        m, s = d["master"], d["summary"]
+        m, s, q = d["master"], d["summary"], d["quality"]
         result = "EXCEPTION" if s["Exceptions"] else "CLEAN"
         ws.append([d["file"], m.get("Agreement No"), m.get("Applicant name"),
                    m.get("Product"), to_num(m.get("Loan Amount (Rs)")),
@@ -780,9 +859,12 @@ def write_portfolio(out_path, results, detail_dir=None):
                    to_num(m.get("First Instalment Amount (Rs)")), m.get("Disbursement Date"),
                    m.get("Loan Status"), to_num(m.get("Principal Paid (Rs)")),
                    to_num(m.get("Interest Paid (Rs)")), to_num(m.get("Instalment overdue (Rs)")),
-                   s["Current Stage"], s["Max DPD"], s["Exceptions"], result])
+                   s["Current Stage"], s["Max DPD"], s["Exceptions"], q["status"], result])
         fill = "FFC7CE" if s["Fails"] else ("FFEB9C" if s["Exceptions"] else "C6EFCE")
         ws.cell(ws.max_row, len(cols)).fill = PatternFill("solid", fgColor=fill)
+        # parse status cell colour (so weakly-parsed loans stand out)
+        ws.cell(ws.max_row, len(cols) - 1).fill = PatternFill(
+            "solid", fgColor=STATUS_FILL.get(q["status"], "DDEBF7"))
     ws.freeze_panes = "A2"; autosize(ws)
 
     # --- Exceptions (only FAIL / REVIEW across all loans) ---
@@ -821,10 +903,26 @@ def write_portfolio(out_path, results, detail_dir=None):
             ws.append([d["file"], agr, c["Category"], c["Date"], c["Particulars"], c["DR"], c["CR"]])
     ws.freeze_panes = "A2"; autosize(ws)
 
+    # --- Parse_Quality (data-integrity log across loans) ---
+    ws = wb.create_sheet("Parse_Quality")
+    cols = ["File", "Agreement No", "Parse Status", "Completeness %",
+            "Missing Critical Fields", "Warnings", "Notes"]
+    ws.append(cols); style_header(ws, 1, len(cols))
+    for d in results:
+        q = d["quality"]
+        ws.append([d["file"], d["master"].get("Agreement No"), q["status"],
+                   q["completeness"], ", ".join(q["missing_critical"]) or "None",
+                   "; ".join(q["warnings"]) or "None",
+                   "; ".join(q.get("notes", [])) or "None"])
+        ws.cell(ws.max_row, 3).fill = PatternFill(
+            "solid", fgColor=STATUS_FILL.get(q["status"], "DDEBF7"))
+    ws.freeze_panes = "A2"; autosize(ws)
+
     wb.save(out_path)
     n_exc = sum(1 for d in results if d["summary"]["Exceptions"])
+    n_rev = sum(1 for d in results if d["quality"]["status"] == "REVIEW")
     print(f"[PORTFOLIO] {len(results)} loans -> {out_path}  "
-          f"({n_exc} loan(s) with exceptions)")
+          f"({n_exc} with exceptions, {n_rev} need parse review)")
 
 
 def process_portfolio(folder, out_path, write_details=True):

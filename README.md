@@ -35,6 +35,7 @@ python extract_soa.py --portfolio ./pdfs Portfolio_Exception_Report.xlsx
 | `Amortization` | Recomputed reducing-balance schedule |
 | `DPD_Analysis` | Per-instalment days-past-due + SMA/NPA stage |
 | `TOC_TOD` | Validation checks (see below) |
+| `Parse_Quality` | Data-integrity log: completeness %, missing fields, structural warnings, cosmetic notes |
 
 ## Portfolio exception report tabs
 - **Portfolio_Summary** — one row per loan with key terms, current stage, max DPD,
@@ -42,6 +43,16 @@ python extract_soa.py --portfolio ./pdfs Portfolio_Exception_Report.xlsx
 - **Exceptions** — only FAIL / REVIEW checks across all loans.
 - **DPD_NPA** — delayed instalments (DPD > 0) across all loans, with stage.
 - **Charges** — all charge line-items across all loans.
+- **Parse_Quality** — per-loan extraction status (OK / REVIEW), completeness %,
+  missing critical fields, structural warnings, and cosmetic notes. Use this to
+  decide which SOAs need manual review before relying on the numbers.
+
+### Parse quality
+Each loan is graded **OK** or **REVIEW**. A loan is flagged **REVIEW** only for
+*structural* problems — a missing critical field (e.g. sanctioned amount, rate) or
+an unparsed section (finance summary, ledger). Purely *cosmetic* issues (e.g. a
+ledger row whose description wrapped across lines, but whose amounts are correct)
+are recorded as **notes** and do **not** force a review.
 
 ## Validation checks (TOC/TOD)
 | ID | Family | Procedure |
