@@ -6,10 +6,18 @@ loan audits. All L&T SOAs share the same layout, so the parser is tuned to it.
 
 ## Install
 ```bash
-pip install pdfplumber openpyxl
+pip install pdfplumber openpyxl flask
 ```
 
-## Usage
+## Web UI (localhost)
+```bash
+python app.py            # then open http://127.0.0.1:5000
+```
+Upload one SOA PDF to download its working-paper workbook, or upload several to
+download a single Portfolio Exception Report bundled with the per-loan workbooks
+(as a zip). Set a custom port with `PORT=8080 python app.py`.
+
+## Command line
 ```bash
 # 1. Single loan -> full working-paper workbook
 python extract_soa.py SOA_xxxx.pdf [output.xlsx]
