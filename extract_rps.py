@@ -28,7 +28,7 @@ CUST_BANK_FIELDS = [
     ("Customer ID", r"Customer ID\s*:"),
     ("Central KYC (CKYC) Id", r"Central KYC\s*:"),
     ("Branch", r"Branch\s*:"),
-    ("Co-applicant Name", r"Co-applicant Name\s*:"),
+    ("Co-applicant Name", r"Co-[Aa]pplicant Name(?:\(s\))?\s*:"),
 ]
 LOAN_FIELDS = [
     ("Disbursement Date", r"Disbursement Date\s*:"),
@@ -40,7 +40,8 @@ LOAN_FIELDS = [
     ("Currency", r"Currency\s*:"),
 ]
 INST_FIELDS = [
-    ("First Instalment Amount (Rs)", r"First Instalment Amount\(Rs\)\s*:"),
+    # SME RPS uses "First Instalment Amount(Rs)"; Personal-Loan RPS uses "EMI Amount (Rs)"
+    ("First Instalment / EMI Amount (Rs)", r"(?:First Instalment Amount\(Rs\)|EMI Amount \(Rs\))\s*:"),
     ("BPI to be collected with First EMI (Rs.)", r"BPI to be collected with First EMI\(Rs\.\)\s*:"),
     ("Instalment start date", r"Instalment start date\s*:"),
     ("Instalment End date", r"Instalment End date\s*:"),
@@ -61,10 +62,12 @@ SCHEDULE_COLUMNS = [
     "Available Limit",
 ]
 
-# instalment row: num, date, opening, instalment, principal, interest, closing, rate, type [, trailing]
-ROW_RE = re.compile(
-    r"^(\d+)\s+(\d{2}-[A-Za-z]{3}-\d{4})\s+([\d,]*\.\d{2})\s+([\d,]*\.\d{2})\s+"
-    r"([\d,]*\.\d{2})\s+([\d,]*\.\d{2})\s+([\d,]*\.\d{2})\s+([\d.]+)\s+([A-Za-z]+)(.*)$")
+# A schedule row starts with an instalment number then a date; the rest is a mix
+# of numbers (varying decimals) and an optional alphabetic "Due Type" token (EMI).
+# Layouts vary: SME RPS has 12 columns (+Due Type/limits); Personal-Loan RPS has 8.
+ROW_RE = re.compile(r"^(\d+)\s+(\d{2}-[A-Za-z]{3}-\d{4})\s+(.*)$")
+_NUM_TOK = re.compile(r"^-?[\d,]*\.\d+$|^-?[\d,]+$")  # 29,219.00 | 1500000.0 | .00 | 17
+_WORD_TOK = re.compile(r"^[A-Za-z]+$")
 
 
 def parse_labeled(cell, fields):
@@ -142,27 +145,37 @@ def extract_master(page0):
 
 
 def extract_schedule(pages_text):
+    """Parse schedule rows across pages, tolerant of column count / decimals."""
     rows = []
     for text in pages_text:
         for line in text.splitlines():
             m = ROW_RE.match(line.strip())
             if not m:
                 continue
-            g = m.groups()
-            trailing = NUMS = re.findall(r"[\d,]*\.\d{2}", g[9] or "")
+            num, date, rest = m.groups()
+            nums, due_type = [], None
+            for tok in rest.split():
+                if _NUM_TOK.match(tok):
+                    nums.append(to_num(tok))
+                elif _WORD_TOK.match(tok):
+                    due_type = tok            # e.g. "EMI"
+            # need at least: opening, instalment, principal, interest, closing, rate
+            if len(nums) < 6:
+                continue
+            extra = nums[6:]                  # trailing limit columns, if any
             rows.append({
-                "Instalment Number": int(g[0]),
-                "Instalment Date": g[1],
-                "Opening Balance": to_num(g[2]),
-                "Instalment Balance": to_num(g[3]),
-                "Principal": to_num(g[4]),
-                "Interest": to_num(g[5]),
-                "Closing Balance": to_num(g[6]),
-                "Annualised Interest Rate %": to_num(g[7]),
-                "Due Type": g[8],
-                "Max Loan Limit": to_num(trailing[0]) if len(trailing) > 0 else None,
-                "Limit Drop": to_num(trailing[1]) if len(trailing) > 1 else None,
-                "Available Limit": to_num(trailing[2]) if len(trailing) > 2 else None,
+                "Instalment Number": int(num),
+                "Instalment Date": date,
+                "Opening Balance": nums[0],
+                "Instalment Balance": nums[1],
+                "Principal": nums[2],
+                "Interest": nums[3],
+                "Closing Balance": nums[4],
+                "Annualised Interest Rate %": nums[5],
+                "Due Type": due_type,
+                "Max Loan Limit": extra[0] if len(extra) > 0 else None,
+                "Limit Drop": extra[1] if len(extra) > 1 else None,
+                "Available Limit": extra[2] if len(extra) > 2 else None,
             })
     return rows
 

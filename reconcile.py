@@ -60,7 +60,10 @@ def reconcile_pair(soa, rps):
     num_fields = [("Loan Amount (Rs)", TOL), ("Annualised Interest Rate %", 0.01),
                   ("Loan Tenure (Months)", 0), ("First Instalment Amount (Rs)", TOL)]
     for f, tol in num_fields:
-        rv, sv = rps["master"].get(f), soa["master"].get(f)
+        rv = rps["master"].get(f)
+        if f == "First Instalment Amount (Rs)" and rv is None:  # RPS stores EMI under a combined label
+            rv = rps["master"].get("First Instalment / EMI Amount (Rs)")
+        sv = soa["master"].get(f)
         rn, sn = to_num(rv), to_num(sv)
         tc(f, rv, sv, rn is not None and sn is not None and abs(rn - sn) <= tol)
     rv, sv = rps["master"].get("Disbursement Date"), soa["master"].get("Disbursement Date")
