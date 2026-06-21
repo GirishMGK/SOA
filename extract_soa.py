@@ -790,11 +790,20 @@ def write_workbook(path, master, fin_rows, recv, disb, txns, checks, dpd_rows,
     wb.save(path)
 
 
+class NotAnSOAError(ValueError):
+    """Raised when a non-SOA document (e.g. a Repayment Schedule) is given to the SOA engine."""
+
+
 def extract_loan(pdf_path):
     """Parse one SOA PDF and return a dict of all extracted data + checks."""
     with pdfplumber.open(pdf_path) as pdf:
         pages = [p.extract_text() or "" for p in pdf.pages]
     full = "\n".join(pages)
+    # Refuse repayment schedules outright - they have none of the SOA ledger/
+    # summary content, so producing SOA sheets from one is meaningless.
+    if re.search(r"Repayment Schedule of", full):
+        raise NotAnSOAError("This is a Repayment Schedule (RPS), not a Statement of "
+                            "Account. Use the RPS tab / extract_rps.py.")
     master = extract_master(full)
     fin_rows, recv = extract_finance_summary(full)
     disb = extract_disbursements(full)
@@ -824,8 +833,21 @@ def extract_loan(pdf_path):
 
 
 def process(pdf_path, out_path):
-    """Extract one SOA and write a full per-loan working-paper workbook."""
-    d = extract_loan(pdf_path)
+    """Extract one SOA and write a full per-loan working-paper workbook.
+
+    If the file is actually a Repayment Schedule, auto-route to the RPS engine
+    so the user gets the right workbook instead of an error or wrong sheets.
+    """
+    try:
+        d = extract_loan(pdf_path)
+    except NotAnSOAError:
+        from extract_rps import extract_rps, write_rps_workbook
+        print(f"[NOTICE] {os.path.basename(pdf_path)} is a Repayment Schedule - "
+              f"producing the RPS workbook (Loan_Details + Repayment_Schedule).")
+        ln = extract_rps(pdf_path)
+        write_rps_workbook(out_path, [ln])
+        print(f"[OK] {ln['file']} -> {out_path}  ({len(ln['schedule'])} schedule rows)")
+        return None
     write_workbook(out_path, d["master"], d["fin_rows"], d["recv"], d["disb"], d["txns"],
                    d["checks"], d["dpd_rows"], part_pay=d["part_pay"], bounce=d["bounce"],
                    charges=d["charges"], amort=d["amort"], bounce_grid=d["bounce_grid"],
@@ -939,7 +961,8 @@ def process_portfolio(folder, out_path, write_details=True):
                 d = process(path, os.path.join(detail_dir, os.path.splitext(f)[0] + ".xlsx"))
             else:
                 d = extract_loan(path)
-            results.append(d)
+            if d:                                    # None => auto-routed RPS, skip in SOA portfolio
+                results.append(d)
         except Exception as e:                       # keep batch resilient
             print(f"[ERROR] {f}: {e}")
     if results:
