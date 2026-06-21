@@ -13,21 +13,30 @@ pip install pdfplumber openpyxl flask
 ```bash
 python app.py            # then open http://127.0.0.1:5000
 ```
-Upload SOAs as **individual PDFs, a whole folder, or a `.zip`**. Files are
-processed one-by-one with a **live progress bar** and an on-screen results
-table showing, per loan: result (CLEAN / EXCEPTION / FAILED), current NPA
-stage, exception count, parse-quality, and sanctioned amount. Running totals
-(uploaded / clean / with-exceptions / failed) update live, and a portfolio
-health line shows NPA count and total sanctioned value.
+Pick a document type with the **SOA / RPS** tabs, then upload SOAs/RPS as
+**individual PDFs, a whole folder, or a `.zip`**. Files stream through with a
+**live progress bar** and an on-screen results table.
 
-Download options after a run:
-- any single loan's workbook (per-row link),
-- the **Portfolio Exception Report**,
-- **all** loans as a zip, or **exceptions only** as a zip.
+**SOA mode** — per-loan working-paper workbooks + a Portfolio Exception Report,
+with TOC/TOD validation. Running totals (uploaded / clean / with-exceptions /
+failed), NPA count, total sanctioned. Download any single loan, the portfolio
+report, all loans (zip), or exceptions-only (zip).
+
+**RPS mode** — one **combined workbook** from all uploaded Repayment Schedules:
+- `Repayment_Schedule` — every schedule row stacked, each tagged with its
+  **Agreement No** so rows trace to the right loan.
+- `Loan_Details` — one row per agreement with all header fields (Customer &
+  Bank, Loan, Instalment details + contact block).
 
 A bad/corrupt file is reported as FAILED with the reason and never aborts the
 batch. Nothing is persisted beyond the running session. Custom port:
 `PORT=8080 python app.py`.
+
+### RPS from the command line
+```bash
+python extract_rps.py schedule.pdf              # single -> 2-sheet workbook
+python extract_rps.py --dir ./rps_pdfs out.xlsx # combine a folder
+```
 
 ## Command line
 ```bash
