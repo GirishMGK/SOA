@@ -315,6 +315,8 @@ def process_stream(job_id):
             rec = {"index": i, "file": display, "ok": False, "exceptions": 0,
                    "stage": "", "parse": "", "sanctioned": None, "error": "", "xlsx": None}
             try:
+                if classify(pdf_path) == "rps":
+                    raise ValueError("This is a Repayment Schedule (RPS) - use the RPS tab")
                 d = extract_loan(pdf_path)
                 xlsx = os.path.join(job["dir"], f"{i:03d}_{os.path.splitext(display)[0]}.xlsx")
                 write_workbook(xlsx, d["master"], d["fin_rows"], d["recv"], d["disb"], d["txns"],
@@ -349,6 +351,8 @@ def process_stream(job_id):
             rec = {"index": i, "file": display, "ok": False, "agreement": "",
                    "instalments": 0, "error": ""}
             try:
+                if classify(pdf_path) == "soa":
+                    raise ValueError("This is a Statement of Account (SOA) - use the SOA tab")
                 ln = extract_rps(pdf_path)
                 loans.append(ln)
                 rec.update(ok=True, agreement=ln["master"].get("Agreement No"),
