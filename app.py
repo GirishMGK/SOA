@@ -32,7 +32,7 @@ from reconcile import classify, reconcile_jobs, write_reconciliation_workbook
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB per request
-VERSION = "4.0"
+VERSION = "4.1"
 
 
 @app.after_request
@@ -99,7 +99,8 @@ PAGE = r"""
   .drop{border:2px dashed #c3ccd6;border-radius:10px;padding:22px;text-align:center;background:#fafbfc;cursor:pointer}
   .drop.drag{border-color:#1F4E78;background:#eef4fb}
   input[type=file]{display:none}
-  .files{margin-top:10px;font-size:13px;color:#374151}
+  .picks{margin-top:10px;font-size:13px}.picks a{color:#1F4E78;font-weight:600;text-decoration:none}
+  .files{margin-top:8px;font-size:13px;color:#374151}
   button{margin-top:14px;color:#fff;border:0;border-radius:8px;padding:11px 18px;font-size:14px;cursor:pointer}
   .b-soa{background:#1F4E78}.b-rps{background:#1d6b32}.b-recon{background:#7a4f00}
   button:hover{filter:brightness(1.08)} button:disabled{opacity:.5;cursor:not-allowed}
@@ -129,25 +130,37 @@ PAGE = r"""
     <p class="ver">Build __VER__ &middot; separate fields for SOA and RPS &mdash; if this line is missing, you are running an old copy</p>
 
     <h2 class="h-soa">1 &middot; SOA &mdash; Statement of Account</h2>
-    <p class="hint">Per-loan TOC/TOD workbooks + portfolio exception report. Upload SOA PDFs / folder-zip.</p>
-    <label class="drop" data-for="soa"><input type="file" id="soa-input" accept=".pdf,.zip" multiple>
-      <div><b>Click or drop SOA PDFs here</b></div><div class="files" id="soa-files"></div></label>
+    <p class="hint">Per-loan TOC/TOD workbooks + portfolio exception report.</p>
+    <div class="drop" id="soa-drop"><div><b>Drop SOA PDFs, a folder, or a .zip here</b></div>
+      <div class="picks"><a href="#" data-files="soa">Choose files / .zip</a> &middot;
+        <a href="#" data-folder="soa">Choose a folder</a></div>
+      <div class="files" id="soa-files"></div></div>
+    <input type="file" id="soa-input" accept=".pdf,.zip" multiple>
+    <input type="file" id="soa-folder" webkitdirectory directory multiple>
     <button class="b-soa" id="soa-go" disabled>Extract SOA</button>
   </div>
 
   <div class="card">
     <h2 class="h-rps">2 &middot; RPS &mdash; Repayment Schedule</h2>
     <p class="hint">Combined workbook: Loan_Details (one row per RPS) + Repayment_Schedule (all rows, tagged with Agreement No). No SOA sheets.</p>
-    <label class="drop" data-for="rps"><input type="file" id="rps-input" accept=".pdf,.zip" multiple>
-      <div><b>Click or drop RPS PDFs here</b></div><div class="files" id="rps-files"></div></label>
+    <div class="drop" id="rps-drop"><div><b>Drop RPS PDFs, a folder, or a .zip here</b></div>
+      <div class="picks"><a href="#" data-files="rps">Choose files / .zip</a> &middot;
+        <a href="#" data-folder="rps">Choose a folder</a></div>
+      <div class="files" id="rps-files"></div></div>
+    <input type="file" id="rps-input" accept=".pdf,.zip" multiple>
+    <input type="file" id="rps-folder" webkitdirectory directory multiple>
     <button class="b-rps" id="rps-go" disabled>Extract RPS</button>
   </div>
 
   <div class="card">
     <h2 class="h-recon">3 &middot; Reconcile &mdash; SOA vs RPS</h2>
     <p class="hint">Upload an SOA and its matching RPS together; matches by Agreement No and flags actual-vs-scheduled deviations.</p>
-    <label class="drop" data-for="recon"><input type="file" id="recon-input" accept=".pdf,.zip" multiple>
-      <div><b>Click or drop SOA + RPS PDFs here</b></div><div class="files" id="recon-files"></div></label>
+    <div class="drop" id="recon-drop"><div><b>Drop SOA + RPS PDFs, a folder, or a .zip here</b></div>
+      <div class="picks"><a href="#" data-files="recon">Choose files / .zip</a> &middot;
+        <a href="#" data-folder="recon">Choose a folder</a></div>
+      <div class="files" id="recon-files"></div></div>
+    <input type="file" id="recon-input" accept=".pdf,.zip" multiple>
+    <input type="file" id="recon-folder" webkitdirectory directory multiple>
     <button class="b-recon" id="recon-go" disabled>Reconcile</button>
   </div>
 
@@ -167,17 +180,38 @@ function pills(defs){document.getElementById('counts').innerHTML=defs.map(d=>
   '<div class="pill '+d.cls+'"><b id="'+d.id+'">0</b><span>'+d.label+'</span></div>').join('');}
 function thead(cols){document.getElementById('thead').innerHTML=cols.map(c=>'<th>'+c+'</th>').join('');}
 
-// wire each upload field + button
+// recursively collect File objects from a drop (handles dropped folders + files)
+function readDir(reader){return new Promise(res=>reader.readEntries(res));}
+function entryFile(entry){return new Promise(res=>entry.file(res));}
+async function walk(entry,out){
+  if(entry.isFile){out.push(await entryFile(entry));}
+  else if(entry.isDirectory){const r=entry.createReader();let b;
+    do{b=await readDir(r);for(const e of b)await walk(e,out);}while(b.length);}
+}
+async function filesFromDrop(dt){
+  const roots=[...dt.items].map(it=>it.webkitGetAsEntry&&it.webkitGetAsEntry()).filter(Boolean);
+  if(roots.length){const out=[];for(const r of roots)await walk(r,out);return out;}
+  return [...dt.files];
+}
+
+// wire each upload field: files input + folder input + pick links + drag/drop
 ['soa','rps','recon'].forEach(mode=>{
-  const inp=document.getElementById(mode+'-input'),go=document.getElementById(mode+'-go'),
-        fl=document.getElementById(mode+'-files'),drop=inp.closest('.drop');
+  const fileInp=document.getElementById(mode+'-input'),folderInp=document.getElementById(mode+'-folder'),
+        go=document.getElementById(mode+'-go'),fl=document.getElementById(mode+'-files'),
+        drop=document.getElementById(mode+'-drop');
   let chosen=[];
   function set(list){chosen=[...list].filter(f=>/\.(pdf|zip)$/i.test(f.name));
-    fl.textContent=chosen.length?chosen.length+' file(s) selected':'';go.disabled=chosen.length===0;}
-  inp.addEventListener('change',e=>set(e.target.files));
+    fl.textContent=chosen.length?chosen.length+' file(s) selected':(list.length?'No PDF/zip in selection':'');
+    go.disabled=chosen.length===0;}
+  fileInp.addEventListener('change',e=>set(e.target.files));
+  folderInp.addEventListener('change',e=>set(e.target.files));
+  document.querySelector('[data-files="'+mode+'"]').addEventListener('click',e=>{e.preventDefault();e.stopPropagation();fileInp.click();});
+  document.querySelector('[data-folder="'+mode+'"]').addEventListener('click',e=>{e.preventDefault();e.stopPropagation();folderInp.click();});
+  drop.addEventListener('click',e=>{if(e.target.tagName!=='A')fileInp.click();});
   ['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('drag');}));
-  ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('drag');}));
-  drop.addEventListener('drop',ev=>{ev.preventDefault();drop.classList.remove('drag');set(ev.dataTransfer.files);});
+  ['dragleave','dragend'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('drag');}));
+  drop.addEventListener('drop',async ev=>{ev.preventDefault();drop.classList.remove('drag');
+    set(await filesFromDrop(ev.dataTransfer));});
   go.addEventListener('click',()=>run(mode,chosen));
 });
 
