@@ -32,6 +32,15 @@ from reconcile import classify, reconcile_jobs, write_reconciliation_workbook
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB per request
+VERSION = "4.0"
+
+
+@app.after_request
+def _no_cache(resp):
+    # never let the browser serve a stale page/script
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 JOBS = {}
 MAX_JOBS = 6
@@ -77,26 +86,25 @@ def _collect_pdfs(files, dest):
 
 PAGE = r"""
 <!doctype html>
-<html><head><meta charset="utf-8"><title>SOA / RPS Extractor</title>
+<html><head><meta charset="utf-8"><title>SOA / RPS Extractor (build __VER__)</title>
 <style>
   body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f4f6f9;color:#1f2d3d;margin:0;padding:32px}
   .wrap{max-width:980px;margin:0 auto}
-  .card{background:#fff;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);padding:28px;margin-bottom:20px}
-  h1{color:#1F4E78;margin:0 0 4px;font-size:22px}
-  p.sub{color:#6b7280;margin:0 0 18px;font-size:14px}
-  .tabs{display:flex;gap:8px;margin-bottom:18px}
-  .tab{flex:1;text-align:center;padding:12px;border-radius:9px;background:#eef2f7;color:#43506180;
-       cursor:pointer;font-weight:600;border:2px solid transparent;color:#5b6675}
-  .tab.active{background:#eef4fb;border-color:#1F4E78;color:#1F4E78}
-  .tab small{display:block;font-weight:400;font-size:11px;color:#7a8595}
-  .drop{border:2px dashed #c3ccd6;border-radius:10px;padding:30px;text-align:center;background:#fafbfc;cursor:pointer}
+  .card{background:#fff;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);padding:24px;margin-bottom:18px}
+  h1{color:#1F4E78;margin:0 0 2px;font-size:22px}
+  .ver{font-size:12px;color:#8a93a0;margin:0 0 18px}
+  h2{font-size:16px;margin:0 0 4px}
+  .h-soa{color:#1F4E78}.h-rps{color:#1d6b32}.h-recon{color:#7a4f00}
+  p.hint{color:#6b7280;margin:0 0 14px;font-size:13px}
+  .drop{border:2px dashed #c3ccd6;border-radius:10px;padding:22px;text-align:center;background:#fafbfc;cursor:pointer}
   .drop.drag{border-color:#1F4E78;background:#eef4fb}
   input[type=file]{display:none}
-  .btnrow{margin-top:16px;display:flex;gap:10px;flex-wrap:wrap}
-  button,.btn{background:#1F4E78;color:#fff;border:0;border-radius:8px;padding:11px 18px;font-size:14px;cursor:pointer;text-decoration:none;display:inline-block}
-  button.sec,.btn.sec{background:#e8edf3;color:#1F4E78}
-  button:hover{filter:brightness(1.07)} button:disabled{opacity:.5;cursor:not-allowed}
-  .files{margin-top:12px;font-size:13px;color:#374151}
+  .files{margin-top:10px;font-size:13px;color:#374151}
+  button{margin-top:14px;color:#fff;border:0;border-radius:8px;padding:11px 18px;font-size:14px;cursor:pointer}
+  .b-soa{background:#1F4E78}.b-rps{background:#1d6b32}.b-recon{background:#7a4f00}
+  button:hover{filter:brightness(1.08)} button:disabled{opacity:.5;cursor:not-allowed}
+  .btn,a.btn{background:#1F4E78;color:#fff;border-radius:8px;padding:11px 18px;font-size:14px;text-decoration:none;display:inline-block;margin-top:6px}
+  .btn.sec{background:#e8edf3;color:#1F4E78}
   #panel{display:none}
   .counts{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px}
   .pill{flex:1;min-width:110px;border-radius:10px;padding:12px 14px;text-align:center}
@@ -104,7 +112,7 @@ PAGE = r"""
   .p-tot{background:#eef2f7}.p-clean{background:#dff3e6}.p-exc{background:#fff4d6}.p-fail{background:#fde2e4}
   .barwrap{background:#e8edf3;border-radius:20px;height:14px;overflow:hidden;margin-bottom:6px}
   .bar{height:100%;width:0;background:#1F4E78;transition:width .25s}
-  .barlbl{font-size:12px;color:#5b6675;margin-bottom:16px}
+  .barlbl{font-size:12px;color:#5b6675;margin-bottom:14px}
   table{width:100%;border-collapse:collapse;font-size:13px}
   th,td{padding:8px 10px;border-bottom:1px solid #eef0f3;text-align:left}
   th{background:#1F4E78;color:#fff;position:sticky;top:0}
@@ -112,32 +120,35 @@ PAGE = r"""
   .t-clean{background:#c6efce;color:#1d6b32}.t-exc{background:#ffeb9c;color:#7a5b00}
   .t-fail{background:#ffc7ce;color:#7a1f2b}.t-rev{background:#ffeb9c;color:#7a5b00}.t-ok{background:#ddf3e6;color:#1d6b32}
   .scroll{max-height:420px;overflow:auto;border:1px solid #eef0f3;border-radius:8px}
-  .summary{font-size:13px;color:#374151;margin:6px 0 16px}
+  .summary{font-size:13px;color:#374151;margin:6px 0 12px}.dlrow{display:flex;gap:10px;flex-wrap:wrap}
   a.dl{color:#1F4E78;font-weight:600;text-decoration:none}
 </style></head>
 <body><div class="wrap">
   <div class="card">
     <h1>L&amp;T Finance Document Extractor</h1>
-    <p class="sub">Choose a document type, then upload PDFs (or a folder / .zip)</p>
-    <div class="tabs">
-      <div class="tab active" id="tab-soa" data-mode="soa">SOA
-        <small>Statement of Account &middot; TOC/TOD checks</small></div>
-      <div class="tab" id="tab-rps" data-mode="rps">RPS
-        <small>Repayment Schedule &middot; combined workbook</small></div>
-      <div class="tab" id="tab-recon" data-mode="recon">Reconcile
-        <small>SOA vs RPS &middot; actual vs scheduled</small></div>
-    </div>
-    <label class="drop" id="drop">
-      <input type="file" id="pdfs" accept=".pdf,.zip" multiple>
-      <div id="label"><b>Click to choose</b> or drop PDFs / a .zip here</div>
-      <div class="files" id="files"></div>
-    </label>
-    <input type="file" id="folder" webkitdirectory directory multiple>
-    <div class="btnrow">
-      <button type="button" id="start" disabled>Extract</button>
-      <button type="button" class="sec" id="pickFolder">Select a folder instead</button>
-      <button type="button" class="sec" id="reset">Reset</button>
-    </div>
+    <p class="ver">Build __VER__ &middot; separate fields for SOA and RPS &mdash; if this line is missing, you are running an old copy</p>
+
+    <h2 class="h-soa">1 &middot; SOA &mdash; Statement of Account</h2>
+    <p class="hint">Per-loan TOC/TOD workbooks + portfolio exception report. Upload SOA PDFs / folder-zip.</p>
+    <label class="drop" data-for="soa"><input type="file" id="soa-input" accept=".pdf,.zip" multiple>
+      <div><b>Click or drop SOA PDFs here</b></div><div class="files" id="soa-files"></div></label>
+    <button class="b-soa" id="soa-go" disabled>Extract SOA</button>
+  </div>
+
+  <div class="card">
+    <h2 class="h-rps">2 &middot; RPS &mdash; Repayment Schedule</h2>
+    <p class="hint">Combined workbook: Loan_Details (one row per RPS) + Repayment_Schedule (all rows, tagged with Agreement No). No SOA sheets.</p>
+    <label class="drop" data-for="rps"><input type="file" id="rps-input" accept=".pdf,.zip" multiple>
+      <div><b>Click or drop RPS PDFs here</b></div><div class="files" id="rps-files"></div></label>
+    <button class="b-rps" id="rps-go" disabled>Extract RPS</button>
+  </div>
+
+  <div class="card">
+    <h2 class="h-recon">3 &middot; Reconcile &mdash; SOA vs RPS</h2>
+    <p class="hint">Upload an SOA and its matching RPS together; matches by Agreement No and flags actual-vs-scheduled deviations.</p>
+    <label class="drop" data-for="recon"><input type="file" id="recon-input" accept=".pdf,.zip" multiple>
+      <div><b>Click or drop SOA + RPS PDFs here</b></div><div class="files" id="recon-files"></div></label>
+    <button class="b-recon" id="recon-go" disabled>Reconcile</button>
   </div>
 
   <div class="card" id="panel">
@@ -145,45 +156,35 @@ PAGE = r"""
     <div class="barwrap"><div class="bar" id="bar"></div></div>
     <div class="barlbl" id="barlbl">Waiting…</div>
     <div class="summary" id="summary"></div>
-    <div class="btnrow" id="dlrow" style="display:none"></div>
-    <div class="scroll"><table>
-      <thead><tr id="thead"></tr></thead><tbody id="rows"></tbody>
-    </table></div>
+    <div class="dlrow" id="dlrow" style="display:none"></div>
+    <div class="scroll"><table><thead><tr id="thead"></tr></thead><tbody id="rows"></tbody></table></div>
   </div>
 </div>
 <script>
-const inp=document.getElementById('pdfs'),folder=document.getElementById('folder'),
-      drop=document.getElementById('drop'),filesDiv=document.getElementById('files'),
-      startBtn=document.getElementById('start'),panel=document.getElementById('panel'),
-      rows=document.getElementById('rows');
-let chosen=[], mode='soa';
-
-document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
-  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
-  t.classList.add('active'); mode=t.dataset.mode; panel.style.display='none';
-}));
-function setFiles(list){
-  chosen=[...list].filter(f=>/\.(pdf|zip)$/i.test(f.name));
-  filesDiv.innerHTML=chosen.length?chosen.length+' file(s) selected':'';
-  startBtn.disabled=chosen.length===0;
-}
-inp.addEventListener('change',e=>setFiles(e.target.files));
-folder.addEventListener('change',e=>setFiles(e.target.files));
-document.getElementById('pickFolder').addEventListener('click',()=>folder.click());
-document.getElementById('reset').addEventListener('click',()=>location.reload());
-['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('drag');}));
-['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('drag');}));
-drop.addEventListener('drop',ev=>{ev.preventDefault();drop.classList.remove('drag');setFiles(ev.dataTransfer.files);});
-
-let tot=0,clean=0,exc=0,fail=0,done=0;
+const panel=document.getElementById('panel'),rows=document.getElementById('rows');
 const fmt=n=>n==null?'':Number(n).toLocaleString('en-IN');
 function pills(defs){document.getElementById('counts').innerHTML=defs.map(d=>
   '<div class="pill '+d.cls+'"><b id="'+d.id+'">0</b><span>'+d.label+'</span></div>').join('');}
 function thead(cols){document.getElementById('thead').innerHTML=cols.map(c=>'<th>'+c+'</th>').join('');}
 
-startBtn.addEventListener('click',async()=>{
+// wire each upload field + button
+['soa','rps','recon'].forEach(mode=>{
+  const inp=document.getElementById(mode+'-input'),go=document.getElementById(mode+'-go'),
+        fl=document.getElementById(mode+'-files'),drop=inp.closest('.drop');
+  let chosen=[];
+  function set(list){chosen=[...list].filter(f=>/\.(pdf|zip)$/i.test(f.name));
+    fl.textContent=chosen.length?chosen.length+' file(s) selected':'';go.disabled=chosen.length===0;}
+  inp.addEventListener('change',e=>set(e.target.files));
+  ['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('drag');}));
+  ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('drag');}));
+  drop.addEventListener('drop',ev=>{ev.preventDefault();drop.classList.remove('drag');set(ev.dataTransfer.files);});
+  go.addEventListener('click',()=>run(mode,chosen));
+});
+
+let tot,clean,exc,fail,done;
+async function run(mode,chosen){
   if(!chosen.length)return;
-  startBtn.disabled=true; panel.style.display='block'; rows.innerHTML='';
+  panel.style.display='block'; panel.scrollIntoView({behavior:'smooth'}); rows.innerHTML='';
   tot=clean=exc=fail=done=0;
   document.getElementById('summary').textContent=''; document.getElementById('dlrow').style.display='none';
   if(mode==='soa'){
@@ -206,7 +207,6 @@ startBtn.addEventListener('click',async()=>{
   catch(err){document.getElementById('barlbl').textContent='Upload failed: '+err;return;}
   tot=job.total; document.getElementById('c-tot').textContent=tot;
   if(!tot){document.getElementById('barlbl').textContent='No PDF files found.';return;}
-
   const es=new EventSource('/process_stream/'+job.job_id);
   es.onmessage=ev=>{
     const d=JSON.parse(ev.data);
@@ -238,9 +238,8 @@ startBtn.addEventListener('click',async()=>{
           '<td>'+(d.agreement||'')+'</td><td>'+(d.ok?d.instalments:'')+'</td>'+
           '<td><span class="tag '+rt+'">'+st+'</span></td></tr>');
       }else{
-        const ok=d.ok&&d.doctype!=='unknown';
-        const rt=ok?'t-ok':'t-fail';
-        const st=ok?(d.doctype.toUpperCase()+' parsed'):('FAILED — '+(d.error||'unrecognised document'));
+        const ok=d.ok&&d.doctype!=='unknown', rt=ok?'t-ok':'t-fail';
+        const st=ok?(d.doctype.toUpperCase()+' parsed'):('FAILED — '+(d.error||'unrecognised'));
         rows.insertAdjacentHTML('beforeend','<tr><td>'+(d.index+1)+'</td><td>'+d.file+'</td>'+
           '<td>'+(d.doctype||'').toUpperCase()+'</td><td>'+(d.agreement||'')+'</td>'+
           '<td><span class="tag '+rt+'">'+st+'</span></td></tr>');
@@ -252,11 +251,10 @@ startBtn.addEventListener('click',async()=>{
         document.getElementById('summary').innerHTML='<b>Portfolio health:</b> '+s.clean+
           ' clean · '+s.exceptions+' with exceptions · '+s.failed+' failed · NPA: '+s.npa+
           ' · Total sanctioned: ₹'+fmt(s.total_sanctioned);
-        dlrow.innerHTML='<a class="btn" href="/download_portfolio/'+job.job_id+'">Portfolio report</a>'+
+        dlrow.innerHTML=(s.parsed>=2?'<a class="btn" href="/download_portfolio/'+job.job_id+'">Portfolio report</a>':'')+
           '<a class="btn sec" href="/download_zip/'+job.job_id+'?filter=all">Download all (zip)</a>'+
           '<a class="btn sec" href="/download_zip/'+job.job_id+'?filter=exceptions">Exceptions only (zip)</a>';
         dlrow.style.display='flex';
-        if(s.parsed<2)dlrow.querySelector('a').style.display='none';
       }else if(mode==='rps'){
         document.getElementById('barlbl').textContent='Done — '+s.parsed+' schedule(s) extracted.';
         document.getElementById('summary').innerHTML='<b>Combined:</b> '+s.parsed+' agreement(s) · '+
@@ -268,22 +266,19 @@ startBtn.addEventListener('click',async()=>{
         document.getElementById('summary').innerHTML='<b>Reconciliation:</b> '+s.matched+
           ' matched ('+s.reconciled+' reconciled, '+s.exceptions+' with deviations) · '+
           s.soa_only+' SOA-only · '+s.rps_only+' RPS-only';
-        if(s.matched>0){
-          dlrow.innerHTML='<a class="btn" href="/download_recon/'+job.job_id+'">Download reconciliation workbook</a>';
-          dlrow.style.display='flex';
-        }
+        if(s.matched>0){dlrow.innerHTML='<a class="btn" href="/download_recon/'+job.job_id+'">Download reconciliation workbook</a>';dlrow.style.display='flex';}
       }
     }
   };
   es.onerror=()=>{document.getElementById('barlbl').textContent='Connection lost during processing.';es.close();};
-});
+}
 </script></body></html>
 """
 
 
 @app.route("/")
 def index():
-    return render_template_string(PAGE)
+    return render_template_string(PAGE.replace("__VER__", VERSION))
 
 
 @app.route("/upload", methods=["POST"])
@@ -316,7 +311,7 @@ def process_stream(job_id):
                    "stage": "", "parse": "", "sanctioned": None, "error": "", "xlsx": None}
             try:
                 if classify(pdf_path) == "rps":
-                    raise ValueError("This is a Repayment Schedule (RPS) - use the RPS tab")
+                    raise ValueError("This is a Repayment Schedule (RPS) - use the RPS field")
                 d = extract_loan(pdf_path)
                 xlsx = os.path.join(job["dir"], f"{i:03d}_{os.path.splitext(display)[0]}.xlsx")
                 write_workbook(xlsx, d["master"], d["fin_rows"], d["recv"], d["disb"], d["txns"],
@@ -352,7 +347,7 @@ def process_stream(job_id):
                    "instalments": 0, "error": ""}
             try:
                 if classify(pdf_path) == "soa":
-                    raise ValueError("This is a Statement of Account (SOA) - use the SOA tab")
+                    raise ValueError("This is a Statement of Account (SOA) - use the SOA field")
                 ln = extract_rps(pdf_path)
                 loans.append(ln)
                 rec.update(ok=True, agreement=ln["master"].get("Agreement No"),
@@ -468,5 +463,5 @@ def download_zip(job_id):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n  SOA / RPS web UI  ->  http://127.0.0.1:{port}\n")
+    print(f"\n  SOA / RPS web UI (build "+VERSION+")  ->  http://127.0.0.1:{port}\n")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
