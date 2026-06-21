@@ -28,6 +28,7 @@ from flask import (Flask, request, render_template_string, send_file,
 
 from extract_soa import extract_loan, write_workbook, write_portfolio, to_num
 from extract_rps import extract_rps, write_rps_workbook
+from reconcile import classify, reconcile_jobs, write_reconciliation_workbook
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB per request
@@ -123,6 +124,8 @@ PAGE = r"""
         <small>Statement of Account &middot; TOC/TOD checks</small></div>
       <div class="tab" id="tab-rps" data-mode="rps">RPS
         <small>Repayment Schedule &middot; combined workbook</small></div>
+      <div class="tab" id="tab-recon" data-mode="recon">Reconcile
+        <small>SOA vs RPS &middot; actual vs scheduled</small></div>
     </div>
     <label class="drop" id="drop">
       <input type="file" id="pdfs" accept=".pdf,.zip" multiple>
@@ -187,10 +190,14 @@ startBtn.addEventListener('click',async()=>{
     pills([{id:'c-tot',cls:'p-tot',label:'Uploaded'},{id:'c-clean',cls:'p-clean',label:'Clean'},
            {id:'c-exc',cls:'p-exc',label:'With exceptions'},{id:'c-fail',cls:'p-fail',label:'Failed'}]);
     thead(['#','File','Result','Stage','Exceptions','Parse','Sanctioned','Download']);
-  }else{
+  }else if(mode==='rps'){
     pills([{id:'c-tot',cls:'p-tot',label:'Uploaded'},{id:'c-clean',cls:'p-clean',label:'Parsed'},
            {id:'c-fail',cls:'p-fail',label:'Failed'}]);
     thead(['#','File','Agreement No','Instalments','Status']);
+  }else{
+    pills([{id:'c-tot',cls:'p-tot',label:'Uploaded'},{id:'c-clean',cls:'p-clean',label:'SOA'},
+           {id:'c-exc',cls:'p-exc',label:'RPS'},{id:'c-fail',cls:'p-fail',label:'Failed'}]);
+    thead(['#','File','Type','Agreement No','Status']);
   }
   const fd=new FormData(); fd.append('mode',mode); chosen.forEach(f=>fd.append('pdfs',f));
   document.getElementById('barlbl').textContent='Uploading…';
@@ -205,7 +212,10 @@ startBtn.addEventListener('click',async()=>{
     const d=JSON.parse(ev.data);
     if(d.type==='progress'){
       done++;
-      if(!d.ok)fail++; else if(mode==='soa'&&d.exceptions>0)exc++; else clean++;
+      if(!d.ok)fail++;
+      else if(mode==='soa'){if(d.exceptions>0)exc++;else clean++;}
+      else if(mode==='recon'){if(d.doctype==='rps')exc++;else if(d.doctype==='soa')clean++;else fail++;}
+      else clean++;
       if(document.getElementById('c-clean'))document.getElementById('c-clean').textContent=clean;
       if(document.getElementById('c-exc'))document.getElementById('c-exc').textContent=exc;
       document.getElementById('c-fail').textContent=fail;
@@ -222,10 +232,17 @@ startBtn.addEventListener('click',async()=>{
           '<td>'+(d.ok?d.exceptions:('— '+(d.error||'')))+'</td>'+
           '<td>'+(d.ok?'<span class="tag '+pt+'">'+d.parse+'</span>':'')+'</td>'+
           '<td>'+(d.sanctioned!=null?fmt(d.sanctioned):'')+'</td><td>'+dl+'</td></tr>');
-      }else{
+      }else if(mode==='rps'){
         const rt=d.ok?'t-ok':'t-fail', st=d.ok?'OK':('FAILED — '+(d.error||''));
         rows.insertAdjacentHTML('beforeend','<tr><td>'+(d.index+1)+'</td><td>'+d.file+'</td>'+
           '<td>'+(d.agreement||'')+'</td><td>'+(d.ok?d.instalments:'')+'</td>'+
+          '<td><span class="tag '+rt+'">'+st+'</span></td></tr>');
+      }else{
+        const ok=d.ok&&d.doctype!=='unknown';
+        const rt=ok?'t-ok':'t-fail';
+        const st=ok?(d.doctype.toUpperCase()+' parsed'):('FAILED — '+(d.error||'unrecognised document'));
+        rows.insertAdjacentHTML('beforeend','<tr><td>'+(d.index+1)+'</td><td>'+d.file+'</td>'+
+          '<td>'+(d.doctype||'').toUpperCase()+'</td><td>'+(d.agreement||'')+'</td>'+
           '<td><span class="tag '+rt+'">'+st+'</span></td></tr>');
       }
     }else if(d.type==='done'){
@@ -240,12 +257,21 @@ startBtn.addEventListener('click',async()=>{
           '<a class="btn sec" href="/download_zip/'+job.job_id+'?filter=exceptions">Exceptions only (zip)</a>';
         dlrow.style.display='flex';
         if(s.parsed<2)dlrow.querySelector('a').style.display='none';
-      }else{
+      }else if(mode==='rps'){
         document.getElementById('barlbl').textContent='Done — '+s.parsed+' schedule(s) extracted.';
         document.getElementById('summary').innerHTML='<b>Combined:</b> '+s.parsed+' agreement(s) · '+
           s.rows+' schedule rows · '+s.failed+' failed';
         dlrow.innerHTML='<a class="btn" href="/download_rps/'+job.job_id+'">Download combined workbook</a>';
         dlrow.style.display='flex';
+      }else{
+        document.getElementById('barlbl').textContent='Done — '+s.matched+' agreement(s) reconciled.';
+        document.getElementById('summary').innerHTML='<b>Reconciliation:</b> '+s.matched+
+          ' matched ('+s.reconciled+' reconciled, '+s.exceptions+' with deviations) · '+
+          s.soa_only+' SOA-only · '+s.rps_only+' RPS-only';
+        if(s.matched>0){
+          dlrow.innerHTML='<a class="btn" href="/download_recon/'+job.job_id+'">Download reconciliation workbook</a>';
+          dlrow.style.display='flex';
+        }
       }
     }
   };
@@ -271,7 +297,8 @@ def upload():
     job_dir = tempfile.mkdtemp(prefix="job_" + job_id + "_")
     pdfs = _collect_pdfs(uploads, job_dir)
     JOBS[job_id] = {"dir": job_dir, "pdfs": pdfs, "results": [], "mode": mode,
-                    "created": time.time(), "portfolio": None, "rps": None, "loans": []}
+                    "created": time.time(), "portfolio": None, "rps": None,
+                    "recon": None, "loans": []}
     return jsonify(job_id=job_id, total=len(pdfs), mode=mode)
 
 
@@ -338,7 +365,40 @@ def process_stream(job_id):
                    "rows": sum(len(l["schedule"]) for l in loans)}
         yield f"data: {json.dumps({'type': 'done', 'summary': summary})}\n\n"
 
-    gen = gen_rps if job["mode"] == "rps" else gen_soa
+    def gen_recon():
+        results, soas, rpss = job["results"], [], []
+        for i, pdf_path in enumerate(job["pdfs"]):
+            display = os.path.basename(pdf_path)[4:]
+            rec = {"index": i, "file": display, "ok": False, "doctype": "unknown",
+                   "agreement": "", "error": ""}
+            try:
+                kind = classify(pdf_path)
+                rec["doctype"] = kind
+                if kind == "soa":
+                    d = extract_loan(pdf_path); soas.append(d)
+                    rec.update(ok=True, agreement=d["master"].get("Agreement No"))
+                elif kind == "rps":
+                    d = extract_rps(pdf_path); rpss.append(d)
+                    rec.update(ok=True, agreement=d["master"].get("Agreement No"))
+                else:
+                    rec["error"] = "not a recognised SOA or RPS"
+            except Exception as e:
+                rec["error"] = str(e)[:120]
+            results.append(rec)
+            yield f"data: {json.dumps({**rec, 'type': 'progress'})}\n\n"
+
+        pairs, soa_only, rps_only = reconcile_jobs(soas, rpss)
+        if pairs:
+            rpath = os.path.join(job["dir"], "SOA_RPS_Reconciliation.xlsx")
+            write_reconciliation_workbook(rpath, pairs, soa_only, rps_only)
+            job["recon"] = rpath
+        summary = {"matched": len(pairs),
+                   "reconciled": sum(1 for p in pairs if p["summary"]["result"] == "RECONCILED"),
+                   "exceptions": sum(1 for p in pairs if p["summary"]["result"] == "EXCEPTION"),
+                   "soa_only": len(soa_only), "rps_only": len(rps_only)}
+        yield f"data: {json.dumps({'type': 'done', 'summary': summary})}\n\n"
+
+    gen = {"rps": gen_rps, "recon": gen_recon}.get(job["mode"], gen_soa)
     return Response(gen(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -370,6 +430,15 @@ def download_rps(job_id):
     if not job or not job.get("rps"):
         abort(404)
     return send_file(job["rps"], as_attachment=True, download_name="RPS_Combined.xlsx")
+
+
+@app.route("/download_recon/<job_id>")
+def download_recon(job_id):
+    job = JOBS.get(job_id)
+    if not job or not job.get("recon"):
+        abort(404)
+    return send_file(job["recon"], as_attachment=True,
+                     download_name="SOA_RPS_Reconciliation.xlsx")
 
 
 @app.route("/download_zip/<job_id>")

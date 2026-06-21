@@ -23,10 +23,19 @@ failed), NPA count, total sanctioned. Download any single loan, the portfolio
 report, all loans (zip), or exceptions-only (zip).
 
 **RPS mode** — one **combined workbook** from all uploaded Repayment Schedules:
+- `Loan_Details` — one row per RPS with all header fields (Customer & Bank,
+  Loan, Instalment details + contact block).
 - `Repayment_Schedule` — every schedule row stacked, each tagged with its
   **Agreement No** so rows trace to the right loan.
-- `Loan_Details` — one row per agreement with all header fields (Customer &
-  Bank, Loan, Instalment details + contact block).
+
+**Reconcile mode** — upload a mix of SOAs and RPS; the tool auto-detects each
+document type, matches them by **Agreement No**, and reports where *actual*
+servicing deviated from the *scheduled* plan:
+- `Reconciliation_Summary` — one row per agreement (term mismatches, matched,
+  amount-mismatch / paid-late / unpaid counts, RECONCILED vs EXCEPTION).
+- `Term_Checks` — static terms (loan amount, rate, tenure, EMI, disb date).
+- `Instalment_Comparison` — per instalment, scheduled vs actual with status.
+- `Unmatched` — agreements present on only one side.
 
 A bad/corrupt file is reported as FAILED with the reason and never aborts the
 batch. Nothing is persisted beyond the running session. Custom port:

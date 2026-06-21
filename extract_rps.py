@@ -180,20 +180,20 @@ def write_rps_workbook(path, loans):
     """Combine one or many RPS extractions into a single 2-sheet workbook."""
     wb = Workbook()
 
-    # --- Sheet 1: Repayment_Schedule (all rows, tagged with Agreement No) ---
-    ws = wb.active; ws.title = "Repayment_Schedule"
+    # --- Sheet 1: Loan_Details (one row per RPS / agreement) ---
+    ws = wb.active; ws.title = "Loan_Details"
+    ws.append(MASTER_COLUMNS); style_header(ws, 1, len(MASTER_COLUMNS))
+    for ln in loans:
+        ws.append([ln["master"].get(c) for c in MASTER_COLUMNS])
+    ws.freeze_panes = "A2"; autosize(ws)
+
+    # --- Sheet 2: Repayment_Schedule (all rows, tagged with Agreement No) ---
+    ws = wb.create_sheet("Repayment_Schedule")
     ws.append(SCHEDULE_COLUMNS); style_header(ws, 1, len(SCHEDULE_COLUMNS))
     for ln in loans:
         agr = ln["master"].get("Agreement No")
         for r in ln["schedule"]:
             ws.append([agr] + [r.get(c) for c in SCHEDULE_COLUMNS[1:]])
-    ws.freeze_panes = "A2"; autosize(ws)
-
-    # --- Sheet 2: Loan_Details (one row per agreement) ---
-    ws = wb.create_sheet("Loan_Details")
-    ws.append(MASTER_COLUMNS); style_header(ws, 1, len(MASTER_COLUMNS))
-    for ln in loans:
-        ws.append([ln["master"].get(c) for c in MASTER_COLUMNS])
     ws.freeze_panes = "A2"; autosize(ws)
 
     wb.save(path)
