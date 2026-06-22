@@ -13,9 +13,13 @@ pip install pdfplumber openpyxl flask
 ```bash
 python app.py            # then open http://127.0.0.1:5000
 ```
-Pick a document type with the **SOA / RPS** tabs, then upload SOAs/RPS as
-**individual PDFs, a whole folder, or a `.zip`**. Files stream through with a
-**live progress bar** and an on-screen results table.
+**One upload box.** Drop any mix of SOA and Repayment Schedule PDFs — as
+**individual files, a whole folder, or a `.zip`**. Each file is **auto-detected**
+(SOA vs RPS), processed accordingly, and any Agreement No present as **both** an
+SOA and an RPS is **reconciled automatically**. A live progress bar + results
+table show each file's type, agreement, and result; **Download everything**
+bundles all outputs (SOA workbooks + portfolio, RPS combined, reconciliation)
+into one zip.
 
 **SOA mode** — per-loan working-paper workbooks + a Portfolio Exception Report,
 with TOC/TOD validation. Running totals (uploaded / clean / with-exceptions /

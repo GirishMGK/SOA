@@ -5,14 +5,14 @@ Run:
     pip install -r requirements.txt
     python app.py            # then open http://127.0.0.1:5000
 
-Two modes:
-  * SOA - Statement of Account: per-loan working-paper workbooks + a portfolio
-    exception report, with TOC/TOD validation checks.
-  * RPS - Repayment Schedule: ONE combined workbook (all schedules stacked with
-    Agreement No + a one-row-per-loan details sheet).
+One upload box. Drop any mix of SOA and Repayment Schedule PDFs (as files, a
+folder, or a .zip); each file is auto-classified and processed:
+  * SOA -> per-loan TOC/TOD workbook (+ a portfolio exception report for 2+).
+  * RPS -> a single combined workbook (Loan_Details + Repayment_Schedule).
+  * any Agreement No present as BOTH an SOA and an RPS is reconciled automatically.
 
-Upload individual PDFs, a whole folder, or a .zip. Files stream through one by
-one with a live progress bar. Everything runs locally; nothing is persisted.
+Files stream through with a live progress bar. Everything runs locally; nothing
+is persisted. "Download everything" bundles all outputs into one zip.
 """
 import io
 import os
@@ -32,7 +32,7 @@ from reconcile import classify, reconcile_jobs, write_reconciliation_workbook
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB per request
-VERSION = "4.1"
+VERSION = "5.0"
 
 
 @app.after_request
@@ -127,41 +127,15 @@ PAGE = r"""
 <body><div class="wrap">
   <div class="card">
     <h1>L&amp;T Finance Document Extractor</h1>
-    <p class="ver">Build __VER__ &middot; separate fields for SOA and RPS &mdash; if this line is missing, you are running an old copy</p>
-
-    <h2 class="h-soa">1 &middot; SOA &mdash; Statement of Account</h2>
-    <p class="hint">Per-loan TOC/TOD workbooks + portfolio exception report.</p>
-    <div class="drop" id="soa-drop"><div><b>Drop SOA PDFs, a folder, or a .zip here</b></div>
-      <div class="picks"><a href="#" data-files="soa">Choose files / .zip</a> &middot;
-        <a href="#" data-folder="soa">Choose a folder</a></div>
-      <div class="files" id="soa-files"></div></div>
-    <input type="file" id="soa-input" accept=".pdf,.zip" multiple>
-    <input type="file" id="soa-folder" webkitdirectory directory multiple>
-    <button class="b-soa" id="soa-go" disabled>Extract SOA</button>
-  </div>
-
-  <div class="card">
-    <h2 class="h-rps">2 &middot; RPS &mdash; Repayment Schedule</h2>
-    <p class="hint">Combined workbook: Loan_Details (one row per RPS) + Repayment_Schedule (all rows, tagged with Agreement No). No SOA sheets.</p>
-    <div class="drop" id="rps-drop"><div><b>Drop RPS PDFs, a folder, or a .zip here</b></div>
-      <div class="picks"><a href="#" data-files="rps">Choose files / .zip</a> &middot;
-        <a href="#" data-folder="rps">Choose a folder</a></div>
-      <div class="files" id="rps-files"></div></div>
-    <input type="file" id="rps-input" accept=".pdf,.zip" multiple>
-    <input type="file" id="rps-folder" webkitdirectory directory multiple>
-    <button class="b-rps" id="rps-go" disabled>Extract RPS</button>
-  </div>
-
-  <div class="card">
-    <h2 class="h-recon">3 &middot; Reconcile &mdash; SOA vs RPS</h2>
-    <p class="hint">Upload an SOA and its matching RPS together; matches by Agreement No and flags actual-vs-scheduled deviations.</p>
-    <div class="drop" id="recon-drop"><div><b>Drop SOA + RPS PDFs, a folder, or a .zip here</b></div>
-      <div class="picks"><a href="#" data-files="recon">Choose files / .zip</a> &middot;
-        <a href="#" data-folder="recon">Choose a folder</a></div>
-      <div class="files" id="recon-files"></div></div>
-    <input type="file" id="recon-input" accept=".pdf,.zip" multiple>
-    <input type="file" id="recon-folder" webkitdirectory directory multiple>
-    <button class="b-recon" id="recon-go" disabled>Reconcile</button>
+    <p class="ver">Build __VER__ &middot; one box for SOA &amp; RPS &mdash; auto-detected &amp; auto-reconciled. If this line is missing, you are running an old copy.</p>
+    <p class="hint">Upload any mix of SOA and Repayment Schedule PDFs &mdash; as individual files, a whole folder, or a .zip. Each file is auto-classified; SOAs get TOC/TOD workbooks + a portfolio report, RPS get a combined schedule workbook, and any agreement with both is reconciled automatically.</p>
+    <div class="drop" id="auto-drop"><div><b>Drop PDFs, a folder, or a .zip here</b></div>
+      <div class="picks"><a href="#" data-files="auto">Choose files / .zip</a> &middot;
+        <a href="#" data-folder="auto">Choose a folder</a></div>
+      <div class="files" id="auto-files"></div></div>
+    <input type="file" id="auto-input" accept=".pdf,.zip" multiple>
+    <input type="file" id="auto-folder" webkitdirectory directory multiple>
+    <button class="b-soa" id="auto-go" disabled>Process</button>
   </div>
 
   <div class="card" id="panel">
@@ -194,47 +168,38 @@ async function filesFromDrop(dt){
   return [...dt.files];
 }
 
-// wire each upload field: files input + folder input + pick links + drag/drop
-['soa','rps','recon'].forEach(mode=>{
-  const fileInp=document.getElementById(mode+'-input'),folderInp=document.getElementById(mode+'-folder'),
-        go=document.getElementById(mode+'-go'),fl=document.getElementById(mode+'-files'),
-        drop=document.getElementById(mode+'-drop');
+// single upload field: files input + folder input + pick links + drag/drop
+(function(){
+  const fileInp=document.getElementById('auto-input'),folderInp=document.getElementById('auto-folder'),
+        go=document.getElementById('auto-go'),fl=document.getElementById('auto-files'),
+        drop=document.getElementById('auto-drop');
   let chosen=[];
   function set(list){chosen=[...list].filter(f=>/\.(pdf|zip)$/i.test(f.name));
     fl.textContent=chosen.length?chosen.length+' file(s) selected':(list.length?'No PDF/zip in selection':'');
     go.disabled=chosen.length===0;}
   fileInp.addEventListener('change',e=>set(e.target.files));
   folderInp.addEventListener('change',e=>set(e.target.files));
-  document.querySelector('[data-files="'+mode+'"]').addEventListener('click',e=>{e.preventDefault();e.stopPropagation();fileInp.click();});
-  document.querySelector('[data-folder="'+mode+'"]').addEventListener('click',e=>{e.preventDefault();e.stopPropagation();folderInp.click();});
+  document.querySelector('[data-files="auto"]').addEventListener('click',e=>{e.preventDefault();e.stopPropagation();fileInp.click();});
+  document.querySelector('[data-folder="auto"]').addEventListener('click',e=>{e.preventDefault();e.stopPropagation();folderInp.click();});
   drop.addEventListener('click',e=>{if(e.target.tagName!=='A')fileInp.click();});
   ['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('drag');}));
   ['dragleave','dragend'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('drag');}));
   drop.addEventListener('drop',async ev=>{ev.preventDefault();drop.classList.remove('drag');
     set(await filesFromDrop(ev.dataTransfer));});
-  go.addEventListener('click',()=>run(mode,chosen));
-});
+  go.addEventListener('click',()=>run(chosen));
+})();
 
-let tot,clean,exc,fail,done;
-async function run(mode,chosen){
+let tot,soa,rps,fail,done;
+async function run(chosen){
   if(!chosen.length)return;
+  document.getElementById('auto-go').disabled=true;
   panel.style.display='block'; panel.scrollIntoView({behavior:'smooth'}); rows.innerHTML='';
-  tot=clean=exc=fail=done=0;
+  tot=soa=rps=fail=done=0;
   document.getElementById('summary').textContent=''; document.getElementById('dlrow').style.display='none';
-  if(mode==='soa'){
-    pills([{id:'c-tot',cls:'p-tot',label:'Uploaded'},{id:'c-clean',cls:'p-clean',label:'Clean'},
-           {id:'c-exc',cls:'p-exc',label:'With exceptions'},{id:'c-fail',cls:'p-fail',label:'Failed'}]);
-    thead(['#','File','Result','Stage','Exceptions','Parse','Sanctioned','Download']);
-  }else if(mode==='rps'){
-    pills([{id:'c-tot',cls:'p-tot',label:'Uploaded'},{id:'c-clean',cls:'p-clean',label:'Parsed'},
-           {id:'c-fail',cls:'p-fail',label:'Failed'}]);
-    thead(['#','File','Agreement No','Instalments','Status']);
-  }else{
-    pills([{id:'c-tot',cls:'p-tot',label:'Uploaded'},{id:'c-clean',cls:'p-clean',label:'SOA'},
-           {id:'c-exc',cls:'p-exc',label:'RPS'},{id:'c-fail',cls:'p-fail',label:'Failed'}]);
-    thead(['#','File','Type','Agreement No','Status']);
-  }
-  const fd=new FormData(); fd.append('mode',mode); chosen.forEach(f=>fd.append('pdfs',f));
+  pills([{id:'c-tot',cls:'p-tot',label:'Uploaded'},{id:'c-soa',cls:'p-clean',label:'SOA'},
+         {id:'c-rps',cls:'p-exc',label:'RPS'},{id:'c-fail',cls:'p-fail',label:'Failed'}]);
+  thead(['#','File','Type','Agreement No','Result','Download']);
+  const fd=new FormData(); fd.append('mode','auto'); chosen.forEach(f=>fd.append('pdfs',f));
   document.getElementById('barlbl').textContent='Uploading…';
   let job;
   try{job=await(await fetch('/upload',{method:'POST',body:fd})).json();}
@@ -246,65 +211,40 @@ async function run(mode,chosen){
     const d=JSON.parse(ev.data);
     if(d.type==='progress'){
       done++;
-      if(!d.ok)fail++;
-      else if(mode==='soa'){if(d.exceptions>0)exc++;else clean++;}
-      else if(mode==='recon'){if(d.doctype==='rps')exc++;else if(d.doctype==='soa')clean++;else fail++;}
-      else clean++;
-      if(document.getElementById('c-clean'))document.getElementById('c-clean').textContent=clean;
-      if(document.getElementById('c-exc'))document.getElementById('c-exc').textContent=exc;
+      if(!d.ok)fail++; else if(d.doctype==='soa')soa++; else if(d.doctype==='rps')rps++; else fail++;
+      document.getElementById('c-soa').textContent=soa;
+      document.getElementById('c-rps').textContent=rps;
       document.getElementById('c-fail').textContent=fail;
       const pct=Math.round(done/tot*100);
       document.getElementById('bar').style.width=pct+'%';
       document.getElementById('barlbl').textContent='Processed '+done+' / '+tot+' ('+pct+'%)';
-      if(mode==='soa'){
-        let rt,res; if(!d.ok){rt='t-fail';res='FAILED';}
-        else if(d.exceptions>0){rt='t-exc';res='EXCEPTION';}else{rt='t-clean';res='CLEAN';}
-        const pt=d.parse==='REVIEW'?'t-rev':'t-ok';
-        const dl=d.ok?'<a class="dl" href="/download/'+job.job_id+'/'+d.index+'">Excel</a>':'';
-        rows.insertAdjacentHTML('beforeend','<tr><td>'+(d.index+1)+'</td><td>'+d.file+'</td>'+
-          '<td><span class="tag '+rt+'">'+res+'</span></td><td>'+(d.stage||'')+'</td>'+
-          '<td>'+(d.ok?d.exceptions:('— '+(d.error||'')))+'</td>'+
-          '<td>'+(d.ok?'<span class="tag '+pt+'">'+d.parse+'</span>':'')+'</td>'+
-          '<td>'+(d.sanctioned!=null?fmt(d.sanctioned):'')+'</td><td>'+dl+'</td></tr>');
-      }else if(mode==='rps'){
-        const rt=d.ok?'t-ok':'t-fail', st=d.ok?'OK':('FAILED — '+(d.error||''));
-        rows.insertAdjacentHTML('beforeend','<tr><td>'+(d.index+1)+'</td><td>'+d.file+'</td>'+
-          '<td>'+(d.agreement||'')+'</td><td>'+(d.ok?d.instalments:'')+'</td>'+
-          '<td><span class="tag '+rt+'">'+st+'</span></td></tr>');
-      }else{
-        const ok=d.ok&&d.doctype!=='unknown', rt=ok?'t-ok':'t-fail';
-        const st=ok?(d.doctype.toUpperCase()+' parsed'):('FAILED — '+(d.error||'unrecognised'));
-        rows.insertAdjacentHTML('beforeend','<tr><td>'+(d.index+1)+'</td><td>'+d.file+'</td>'+
-          '<td>'+(d.doctype||'').toUpperCase()+'</td><td>'+(d.agreement||'')+'</td>'+
-          '<td><span class="tag '+rt+'">'+st+'</span></td></tr>');
-      }
+      let type,rt,res,dl='';
+      if(!d.ok){type=(d.doctype||'').toUpperCase()||'?';rt='t-fail';res='FAILED — '+(d.error||'unrecognised');}
+      else if(d.doctype==='soa'){type='SOA';
+        if(d.exceptions>0){rt='t-exc';res=d.stage&&d.stage.indexOf('NPA')>=0?'EXCEPTION · '+d.stage:'EXCEPTION';}
+        else{rt='t-clean';res='CLEAN';}
+        dl='<a class="dl" href="/download/'+job.job_id+'/'+d.index+'">Excel</a>';}
+      else{type='RPS';rt='t-ok';res=d.instalments+' instalments';}
+      rows.insertAdjacentHTML('beforeend','<tr><td>'+(d.index+1)+'</td><td>'+d.file+'</td>'+
+        '<td>'+type+'</td><td>'+(d.agreement||'')+'</td>'+
+        '<td><span class="tag '+rt+'">'+res+'</span></td><td>'+dl+'</td></tr>');
     }else if(d.type==='done'){
       es.close(); const s=d.summary, dlrow=document.getElementById('dlrow');
-      if(mode==='soa'){
-        document.getElementById('barlbl').textContent='Done — processed '+s.total+' file(s).';
-        document.getElementById('summary').innerHTML='<b>Portfolio health:</b> '+s.clean+
-          ' clean · '+s.exceptions+' with exceptions · '+s.failed+' failed · NPA: '+s.npa+
-          ' · Total sanctioned: ₹'+fmt(s.total_sanctioned);
-        dlrow.innerHTML=(s.parsed>=2?'<a class="btn" href="/download_portfolio/'+job.job_id+'">Portfolio report</a>':'')+
-          '<a class="btn sec" href="/download_zip/'+job.job_id+'?filter=all">Download all (zip)</a>'+
-          '<a class="btn sec" href="/download_zip/'+job.job_id+'?filter=exceptions">Exceptions only (zip)</a>';
-        dlrow.style.display='flex';
-      }else if(mode==='rps'){
-        document.getElementById('barlbl').textContent='Done — '+s.parsed+' schedule(s) extracted.';
-        document.getElementById('summary').innerHTML='<b>Combined:</b> '+s.parsed+' agreement(s) · '+
-          s.rows+' schedule rows · '+s.failed+' failed';
-        dlrow.innerHTML='<a class="btn" href="/download_rps/'+job.job_id+'">Download combined workbook</a>';
-        dlrow.style.display='flex';
-      }else{
-        document.getElementById('barlbl').textContent='Done — '+s.matched+' agreement(s) reconciled.';
-        document.getElementById('summary').innerHTML='<b>Reconciliation:</b> '+s.matched+
-          ' matched ('+s.reconciled+' reconciled, '+s.exceptions+' with deviations) · '+
-          s.soa_only+' SOA-only · '+s.rps_only+' RPS-only';
-        if(s.matched>0){dlrow.innerHTML='<a class="btn" href="/download_recon/'+job.job_id+'">Download reconciliation workbook</a>';dlrow.style.display='flex';}
-      }
+      document.getElementById('barlbl').textContent='Done — '+(s.soa+s.rps)+' document(s) processed.';
+      document.getElementById('summary').innerHTML='<b>SOA:</b> '+s.soa+' ('+s.soa_clean+' clean, '+
+        s.soa_exc+' with exceptions) &nbsp; <b>RPS:</b> '+s.rps+' &nbsp; <b>Auto-reconciled:</b> '+
+        s.reconciled+' agreement(s)'+(s.deviations?' ('+s.deviations+' with deviations)':'')+
+        (s.failed?' &nbsp; <b>Failed:</b> '+s.failed:'');
+      let btns='<a class="btn" href="/download_all/'+job.job_id+'">Download everything (zip)</a>';
+      if(s.has_portfolio)btns+='<a class="btn sec" href="/download_portfolio/'+job.job_id+'">SOA portfolio</a>';
+      if(s.has_rps)btns+='<a class="btn sec" href="/download_rps/'+job.job_id+'">RPS combined</a>';
+      if(s.has_recon)btns+='<a class="btn sec" href="/download_recon/'+job.job_id+'">Reconciliation</a>';
+      dlrow.innerHTML=btns; dlrow.style.display='flex';
+      document.getElementById('auto-go').disabled=false;
     }
   };
-  es.onerror=()=>{document.getElementById('barlbl').textContent='Connection lost during processing.';es.close();};
+  es.onerror=()=>{document.getElementById('barlbl').textContent='Connection lost during processing.';es.close();
+    document.getElementById('auto-go').disabled=false;};
 }
 </script></body></html>
 """
@@ -320,7 +260,7 @@ def upload():
     uploads = request.files.getlist("pdfs")
     if not uploads:
         return jsonify(error="No files received."), 400
-    mode = request.form.get("mode", "soa")
+    mode = request.form.get("mode", "auto")
     _purge_old_jobs()
     job_id = uuid.uuid4().hex
     job_dir = tempfile.mkdtemp(prefix="job_" + job_id + "_")
@@ -431,7 +371,75 @@ def process_stream(job_id):
                    "soa_only": len(soa_only), "rps_only": len(rps_only)}
         yield f"data: {json.dumps({'type': 'done', 'summary': summary})}\n\n"
 
-    gen = {"rps": gen_rps, "recon": gen_recon}.get(job["mode"], gen_soa)
+    def gen_auto():
+        """Single field: auto-detect each file, build SOA + RPS outputs, and
+        auto-reconcile any agreement that has both."""
+        results = job["results"]
+        soas, rpss = [], []
+        for i, pdf_path in enumerate(job["pdfs"]):
+            display = os.path.basename(pdf_path)[4:]
+            rec = {"index": i, "file": display, "ok": False, "doctype": "unknown",
+                   "agreement": "", "exceptions": 0, "stage": "", "instalments": 0,
+                   "error": "", "xlsx": None}
+            try:
+                kind = classify(pdf_path)
+                rec["doctype"] = kind
+                if kind == "soa":
+                    d = extract_loan(pdf_path)
+                    xlsx = os.path.join(job["dir"], f"{i:03d}_{os.path.splitext(display)[0]}.xlsx")
+                    write_workbook(xlsx, d["master"], d["fin_rows"], d["recv"], d["disb"], d["txns"],
+                                   d["checks"], d["dpd_rows"], part_pay=d["part_pay"], bounce=d["bounce"],
+                                   charges=d["charges"], amort=d["amort"], bounce_grid=d["bounce_grid"],
+                                   quality=d["quality"])
+                    rec.update(ok=True, agreement=d["master"].get("Agreement No"),
+                               exceptions=d["summary"]["Exceptions"], stage=d["summary"]["Current Stage"],
+                               xlsx=xlsx, data=d)
+                    soas.append(d)
+                elif kind == "rps":
+                    d = extract_rps(pdf_path)
+                    rec.update(ok=True, agreement=d["master"].get("Agreement No"),
+                               instalments=len(d["schedule"]), data=d)
+                    rpss.append(d)
+                else:
+                    rec["error"] = "not a recognised SOA or RPS document"
+            except Exception as e:
+                rec["error"] = str(e)[:120]
+            results.append(rec)
+            pl = {k: rec[k] for k in ("index", "file", "ok", "doctype", "agreement",
+                                      "exceptions", "stage", "instalments", "error")}
+            pl["type"] = "progress"
+            yield f"data: {json.dumps(pl)}\n\n"
+
+        # SOA outputs
+        good_soa = [r for r in results if r["doctype"] == "soa" and r["ok"]]
+        if len(good_soa) >= 2:
+            ppath = os.path.join(job["dir"], "Portfolio_Exception_Report.xlsx")
+            write_portfolio(ppath, [r["data"] for r in good_soa]); job["portfolio"] = ppath
+        # RPS combined output
+        if rpss:
+            rpath = os.path.join(job["dir"], "RPS_Combined.xlsx")
+            write_rps_workbook(rpath, rpss); job["rps"] = rpath
+        # auto reconciliation
+        pairs, soa_only, rps_only = reconcile_jobs(soas, rpss)
+        if pairs:
+            xpath = os.path.join(job["dir"], "SOA_RPS_Reconciliation.xlsx")
+            write_reconciliation_workbook(xpath, pairs, soa_only, rps_only); job["recon"] = xpath
+
+        summary = {
+            "soa": len(good_soa),
+            "soa_clean": sum(1 for r in good_soa if r["exceptions"] == 0),
+            "soa_exc": sum(1 for r in good_soa if r["exceptions"] > 0),
+            "rps": len(rpss),
+            "failed": sum(1 for r in results if not r["ok"]),
+            "reconciled": len(pairs),
+            "deviations": sum(1 for p in pairs if p["summary"]["result"] == "EXCEPTION"),
+            "has_portfolio": bool(job.get("portfolio")),
+            "has_rps": bool(job.get("rps")),
+            "has_recon": bool(job.get("recon")),
+        }
+        yield f"data: {json.dumps({'type': 'done', 'summary': summary})}\n\n"
+
+    gen = {"rps": gen_rps, "recon": gen_recon, "auto": gen_auto}.get(job["mode"], gen_soa)
     return Response(gen(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -446,6 +454,30 @@ def download_one(job_id, idx):
         abort(404)
     return send_file(rec["xlsx"], as_attachment=True,
                      download_name=os.path.splitext(rec["file"])[0] + ".xlsx")
+
+
+@app.route("/download_all/<job_id>")
+def download_all(job_id):
+    """Bundle everything produced for a job: SOA per-loan books + portfolio,
+    RPS combined workbook, and the reconciliation workbook."""
+    job = JOBS.get(job_id)
+    if not job:
+        abort(404)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for r in job["results"]:
+            if r.get("xlsx") and os.path.exists(r["xlsx"]):
+                z.write(r["xlsx"], os.path.join("SOA_loan_details",
+                        os.path.splitext(r["file"])[0] + ".xlsx"))
+        if job.get("portfolio"):
+            z.write(job["portfolio"], "SOA_Portfolio_Exception_Report.xlsx")
+        if job.get("rps"):
+            z.write(job["rps"], "RPS_Combined.xlsx")
+        if job.get("recon"):
+            z.write(job["recon"], "SOA_RPS_Reconciliation.xlsx")
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, mimetype="application/zip",
+                     download_name="LTF_results.zip")
 
 
 @app.route("/download_portfolio/<job_id>")
