@@ -32,28 +32,43 @@ CUST_BANK_FIELDS = [
 ]
 LOAN_FIELDS = [
     ("Disbursement Date", r"Disbursement Date\s*:"),
-    ("Loan Amount (Rs)", r"Loan Amount \(Rs\)\s*:"),
+    # HL uses "Amount Sanctioned (Rs)"; others use "Loan Amount (Rs)"
+    ("Loan Amount (Rs)", r"(?:Loan Amount|Amount Sanctioned)\s*\(Rs\)\s*:"),
+    ("Amount Disbursed (Rs)", r"Amount Disbursed\s*\(Rs\)\s*:"),
     ("Annualised Interest Rate %", r"Annualised Interest Rate %\s*:"),
     ("Interest Rate Type", r"Interest Rate Type\s*:"),
     ("Loan Tenure (Months)", r"Loan Tenure \(Months\)\s*:"),
+    ("Subvention", r"Subvention\s*:"),
+    ("Subvention Period (Months)", r"Subvention Period \(Months\)\s*:"),
     ("Loan Status", r"Loan Status\s*:"),
     ("Currency", r"Currency\s*:"),
 ]
 INST_FIELDS = [
-    # SME RPS uses "First Instalment Amount(Rs)"; Personal-Loan RPS uses "EMI Amount (Rs)"
-    ("First Instalment / EMI Amount (Rs)", r"(?:First Instalment Amount\(Rs\)|EMI Amount \(Rs\))\s*:"),
-    ("BPI to be collected with First EMI (Rs.)", r"BPI to be collected with First EMI\(Rs\.\)\s*:"),
+    # SME: "First Instalment Amount(Rs)"; PL/TW/HL: "EMI Amount (Rs)" / "EMI Amount(Rs)"
+    ("First Instalment / EMI Amount (Rs)", r"(?:First Instalment Amount|EMI Amount)\s*\(Rs\)\s*:"),
+    # TW/PL: "BPI to be collected with First EMI(Rs.)"; HL: "BPI Amount(Rs)"
+    ("BPI (Rs)", r"(?:BPI to be collected with First EMI\(Rs\.\)|BPI Amount\s*\(Rs\))\s*:"),
+    ("BPI Due date", r"BPI Due date\s*:"),
     ("Instalment start date", r"Instalment start date\s*:"),
     ("Instalment End date", r"Instalment End date\s*:"),
     ("Frequency", r"Frequency\s*:"),
     ("EMI Due Date", r"EMI Due Date\s*:"),
     ("Available Limit", r"Available Limit\s*:"),
 ]
-CONTACT_FIELDS = ["Customer Name", "Address", "Phone No", "Mobile No", "Email", "Product"]
+# right-hand "Product & ... Details" cell (varies by product)
+PRODUCT_FIELDS = [
+    ("Product", r"Product\s*:"),
+    ("Scheme", r"Scheme\s*:"),
+    ("Model Description", r"Model Description\s*:"),
+    ("Registration No", r"Registration No\s*:"),
+    ("Property Address", r"Property Address\s*:"),
+]
+CONTACT_FIELDS = ["Customer Name", "Address", "Phone No", "Mobile No", "Email"]
 
 # final column order for the Loan_Details sheet
 MASTER_COLUMNS = ([n for n, _ in CUST_BANK_FIELDS] + [n for n, _ in LOAN_FIELDS]
-                  + [n for n, _ in INST_FIELDS] + CONTACT_FIELDS)
+                  + [n for n, _ in INST_FIELDS] + [n for n, _ in PRODUCT_FIELDS]
+                  + CONTACT_FIELDS)
 
 SCHEDULE_COLUMNS = [
     "Agreement No", "Instalment Number", "Instalment Date", "Opening Balance",
@@ -87,23 +102,23 @@ def parse_labeled(cell, fields):
 
 
 def parse_contact(cell, product_cell):
-    """Parse the 'Customer Name & Contact Details' + 'Product Details' cells."""
+    """Parse the 'Customer Name & Contact Details' + product/asset/property cells."""
     out = {k: None for k in CONTACT_FIELDS}
     if cell:
         lines = [l.strip() for l in cell.split("\n") if l.strip()]
         if lines:
             out["Customer Name"] = lines[0]
-        lab = parse_labeled(cell, [("Phone No", r"Phone No\s*:"),
-                                   ("Mobile No", r"Mobile No\s*:"),
-                                   ("Email", r"Email\s*:")])
-        out.update(lab)
-        # address = lines between the name and the first labelled line
+        out.update(parse_labeled(cell, [("Phone No", r"Phone No\s*:"),
+                                         ("Mobile No", r"Mobile No\s*:"),
+                                         ("Email", r"Email\s*:"),
+                                         ("Registration No", r"Registration No\s*:")]))
         addr = [l for l in lines[1:]
-                if not re.match(r"(Phone No|Mobile No|Email)\s*:", l)]
+                if not re.match(r"(Phone No|Mobile No|Email|Registration No)\s*:", l)]
         out["Address"] = " ".join(addr) or None
-    if product_cell:
-        out["Product"] = re.sub(r"\s+", " ", product_cell.replace("\n", " ")
-                                ).replace("Product:", "").strip()
+    prod = parse_labeled(product_cell, PRODUCT_FIELDS) if product_cell else {}
+    for k, v in prod.items():
+        if v:                       # don't overwrite a Registration No found in the contact cell
+            out[k] = v
     return out
 
 
@@ -115,6 +130,19 @@ def _find_table(tables, *headers):
             continue
         head = [(c or "").strip().lower() for c in t[0]]
         if all(any(w == h for h in head) for w in want) and len(t) > 1:
+            return t[1]
+    return None
+
+
+def _find_table_starts(tables, first_header):
+    """Return data cells of the table whose first header cell starts with `first_header`.
+
+    The right-hand header varies by product ('Product Details', 'Product & Asset
+    Details', 'Product & Property Details'), so match on the first column only.
+    """
+    key = first_header.lower()
+    for t in tables:
+        if t and len(t) > 1 and (t[0][0] or "").strip().lower().startswith(key):
             return t[1]
     return None
 
@@ -132,7 +160,7 @@ def extract_master(page0):
         if master.get("Central KYC (CKYC) Id"):
             master["Central KYC (CKYC) Id"] = master["Central KYC (CKYC) Id"].replace("(CKYC) Id", "").strip()
 
-    contact = _find_table(tables, "Customer Name & Contact Details", "Product Details")
+    contact = _find_table_starts(tables, "Customer Name & Contact Details")
     if contact:
         master.update(parse_contact(contact[0], contact[1] if len(contact) > 1 else None))
 
@@ -157,8 +185,8 @@ def extract_schedule(pages_text):
             for tok in rest.split():
                 if _NUM_TOK.match(tok):
                     nums.append(to_num(tok))
-                elif _WORD_TOK.match(tok):
-                    due_type = tok            # e.g. "EMI"
+                elif _WORD_TOK.match(tok) and due_type is None:
+                    due_type = tok            # first word = Due Type (e.g. EMI); ignore trailing NA NA NA
             # need at least: opening, instalment, principal, interest, closing, rate
             if len(nums) < 6:
                 continue
